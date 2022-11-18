@@ -1,6 +1,13 @@
-# Do not change version. This is the version of aws buildspec, not the version of your buldspec file.
 version: 0.2
 
+phases:
+  build:
+    commands:
+    -echo "This is build phase... Zipping my we webpage"
+    
+  post_build:
+    commands:
+    -echo "epolyed to s3"
 artifacts:
   files:
     - index.html
