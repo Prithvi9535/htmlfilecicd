@@ -1,5 +1,3 @@
-
-
 version: 0.2
 
 phases:
@@ -13,4 +11,5 @@ phases:
 artifacts:
   files:
     - '**/*'
+    - index.html
     
