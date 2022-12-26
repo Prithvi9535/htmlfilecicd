@@ -1,0 +1,990 @@
+let AWS = require('aws-sdk');
+var docClient = new AWS.DynamoDB.DocumentClient();
+var cognitoidentityserviceprovider = new AWS.CognitoIdentityServiceProvider({ apiVersion: '2016-04-18' });
+var uuid = require("uuid");
+var constants = require('constants.json');
+
+//Dynamo Functions
+function query_dynamo(params, callback, callbackFn) {
+    docClient.query(params, function(err, data) {
+        if (err) {
+            callback(new Error(err));
+        }
+        else {
+            if (typeof callbackFn === 'function') {
+                callbackFn(data);
+            }
+        }
+    });
+}
+
+function insert_dynamo(params, callback, callbackFn) {
+    docClient.put(params, function(err, data) {
+        if (err) {
+            callback(new Error(err));
+        }
+        else {
+            if (typeof callbackFn === 'function') {
+                callbackFn(data);
+            }
+        }
+    });
+}
+
+function update_dynamo(params, callback, callbackFn) {
+    docClient.update(params, function(err, data) {
+        if (err) {
+            callback(new Error(err));
+        }
+        else {
+            if (typeof callbackFn === 'function') {
+                callbackFn(data);
+            }
+        }
+    });
+}
+
+function scan_dynamo(params, callback, callbackFn) {
+    docClient.scan(params, function(err, data) {
+        if (err) {
+            callback(new Error(err));
+        }
+        else {
+            if (typeof callbackFn === 'function') {
+                callbackFn(data);
+            }
+        }
+    });
+}
+
+function delete_dynamo(params, callback, callbackFn) {
+    docClient.delete(params, function(err, data) {
+        if (err) {
+            callback(new Error(err));
+        }
+        else {
+            if (typeof callbackFn === 'function') {
+                callbackFn(data);
+            }
+        }
+    });
+}
+
+
+function queryDynamo(params, callback, callbackFn) {
+    docClient.query(params, function(err, data) {
+        if (err) {
+            callback(new Error(err));
+        }
+        else {
+            if (typeof callbackFn === 'function') {
+                callbackFn(data);
+            }
+        }
+    });
+}
+
+function delete_cognito_user(user_email_id, pool_id, callback, callbackFn) {
+    let checkCognitoUserPresentOrNot = {
+        UserPoolId: pool_id,
+        Username: user_email_id.trim(),
+    };
+    cognitoidentityserviceprovider.adminDeleteUser(checkCognitoUserPresentOrNot, function(err, data) {
+        if (!err) {
+            callbackFn(data);
+        }
+        else {
+            callback(new Error('Unable to delete Cognito Account with Email_ID : ' + user_email_id.toLowerCase()));
+        }
+    });
+}
+
+
+function create_cognito_user(email_id, poolId, callback, callbackFn) {
+    let params = {
+        UserPoolId: poolId,
+        Username: email_id.trim().toLowerCase(),
+        UserAttributes: [{
+                Name: 'email',
+                Value: email_id.trim().toLowerCase(),
+            },
+            {
+                Name: 'email_verified',
+                Value: 'true',
+            },
+        ],
+        TemporaryPassword: (+Date.now()).toString(32),
+    };
+    cognitoidentityserviceprovider.adminCreateUser(params, function(err, data) {
+        if (!err) {
+            callbackFn(data);
+        }
+        else {
+            // logErrorMsg(err, params, null, callback, function(data) {
+            callback(new Error('Unable to create Cognito Account with Email_ID : ' + email_id.toLowerCase()));
+            // });
+        }
+    });
+}
+
+
+//BMS USER MANAGEMENT
+function create_user(event, context, callback) {
+    if (event.user_email_id.trim().length > 0 && event.user_name.trim().length > 0) {
+        let checkIfUserExists = {
+            TableName: "price_drop_bms",
+            IndexName: "user_email_id-index",
+            KeyConditionExpression: "#user_email_id = :user_email_id",
+            ExpressionAttributeNames: {
+                "#user_email_id": "user_email_id",
+            },
+            ExpressionAttributeValues: {
+                ":user_email_id": event.user_email_id.trim().toLowerCase()
+            }
+        };
+        query_dynamo(checkIfUserExists, callback, function(user) {
+            if (user.Count == 0) {
+                create_cognito_user(event.user_email_id.trim().toLowerCase(), constants.BmsCognito, callback, function(data) {
+                    let newBMSUser = {
+                        Item: {
+                            "user_id": uuid.v4(),
+                            "user_name": event.user_name,
+                            "user_email_id": event.user_email_id.trim().toLowerCase(),
+                            "user_created_on": new Date().getTime()
+                        },
+                        TableName: "price_drop_bms",
+                        ConditionExpression: "attribute_not_exists(user_id)",
+                        ReturnValues: "ALL_OLD"
+                    };
+                    insert_dynamo(newBMSUser, callback, function(data) {
+                        callback(null, { status: 'Success', Status_Message: "Created BMS User With Email_ID " + event.user_email_id.trim().toLowerCase() + " Successfully" });
+                    });
+                });
+            }
+            else {
+                callback(new Error("BMS User With Email :" + event.user_email_id + " Already Exists"));
+            }
+        });
+    }
+    else {
+        callback(new Error("Kindly Enter User Email ID And Name To Create User"));
+    }
+}
+
+function list_users(event, context, callback) {
+    let getUsers = {
+        TableName: 'price_drop_bms',
+        ScanIndexForward: false,
+        Limit: 100,
+    };
+    scan_dynamo(getUsers, callback, function(data) {
+        if (data.Count > 0) {
+            let response = {};
+            response.items = data.Items;
+            if (data.LastEvaluatedKey != undefined && data.LastEvaluatedKey != null) {}
+            callback(null, {
+                status: 'SUCCESS',
+                data: response,
+            });
+        }
+        else {
+            callback(new Error('Currently there are No Users Created'));
+        }
+    });
+}
+
+function update_user(event, context, callback) {
+    if (event.user_id != undefined && event.user_id.trim().length > 0) {
+        let getUserDetailsParams = {
+            TableName: "price_drop_bms",
+            KeyConditionExpression: "user_id = :user_id",
+            FilterExpression: "user_status = :user_status",
+            ExpressionAttributeValues: {
+                ":user_id": event.user_id,
+                ":user_status": "ACTIVE"
+            }
+        };
+        query_dynamo(getUserDetailsParams, callback, function(data) {
+            if (data.Count > 0) {
+                let params = {
+                    TableName: "price_drop_bms",
+                    Key: {
+                        "user_id": event.user_id
+                    },
+                    UpdateExpression: "SET user_name = :user_name",
+                    ExpressionAttributeValues: {
+                        ":user_name": event.user_name
+                    },
+                };
+                update_dynamo(params, callback, function(data) {
+                    callback(null, { status: "SUCCESS", status_message: "User Update Successfully" });
+                });
+            }
+            else {
+                callback(new Error("user Not Found!"));
+            }
+        });
+    }
+    else {
+        callback(new Error("Kindly! Enter User ID To be Updated"));
+    }
+}
+
+function delete_user(event, context, callback) {
+    if (event.user_id != undefined && event.user_id.trim().length > 0) {
+        let getUserDetailsParams = {
+            TableName: "price_drop_bms",
+            KeyConditionExpression: "user_id = :user_id",
+            ExpressionAttributeValues: {
+                ":user_id": event.user_id,
+            }
+        };
+        query_dynamo(getUserDetailsParams, callback, (data) => {
+            if (data.Count > 0) {
+                console.log(data);
+                let deleteUserParams = {
+                    TableName: 'price_drop_bms',
+                    Key: {
+                        user_id: event.user_id,
+                    },
+                };
+                delete_dynamo(deleteUserParams, callback, function(data) {
+                    callback(null, { status: "SUCCESS", status_message: "User deleted Successfully" });
+                });
+            }
+            else {
+                callback(new Error("Student Not Found!"));
+            }
+        });
+    }
+    else {
+        callback(new Error("Kindly! Enter User ID To be Updated"));
+    }
+}
+
+function list_bms_users(event, context, callback) {
+    let getCoupon = {
+        TableName: 'price_drop_bms',
+        ScanIndexForward: false,
+        Limit: 100,
+    };
+    scan_dynamo(getCoupon, callback, function(data) {
+        if (data.Count > 0) {
+            let response = {};
+            response.items = data.Items;
+            if (data.LastEvaluatedKey != undefined && data.LastEvaluatedKey != null) {}
+            callback(null, {
+                status: 'SUCCESS',
+                data: response,
+            });
+        }
+        else {
+            callback(new Error('Currently there are No coupon'));
+        }
+    });
+}
+
+function list_buyers_sellers(event, context, callback) {
+    let getCoupon = {
+        TableName: 'price_drop_user',
+        ScanIndexForward: false,
+        Limit: 100,
+    };
+    scan_dynamo(getCoupon, callback, function(data) {
+        if (data.Count > 0) {
+            let response = {};
+            response.items = data.Items;
+            if (data.LastEvaluatedKey != undefined && data.LastEvaluatedKey != null) {}
+            callback(null, {
+                status: 'SUCCESS',
+                data: response,
+            });
+        }
+        else {
+            callback(new Error('Currently there are No coupon'));
+        }
+    });
+}
+
+function list_post(event, context, callback) {
+    let getCoupon = {
+        TableName: 'price_drop_posts',
+        ScanIndexForward: false,
+        Limit: 100,
+    };
+    scan_dynamo(getCoupon, callback, function(data) {
+        if (data.Count > 0) {
+            let response = {};
+            response.items = data.Items;
+            response.items = response.items.sort((a, b) => { b.post_createdon - a.post_createdon });
+            if (data.LastEvaluatedKey != undefined && data.LastEvaluatedKey != null) {}
+            callback(null, {
+                status: 'SUCCESS',
+                data: response,
+            });
+        }
+        else {
+            callback(new Error('Currently there are No coupon'));
+        }
+    });
+}
+
+function list_post_status(event, context, callback) {
+    let checkPostStatusLive = {
+        TableName: 'price_drop_posts',
+        IndexName: 'post_status-post_expire_time-index',
+        KeyConditionExpression: "post_status = :post_status",
+        ExpressionAttributeValues: {
+            ':post_status': event.post_status
+        }
+    };
+    queryDynamo(checkPostStatusLive, callback, function(data) {
+        if (data.Count > 0) {
+            let response = {};
+            response.items = data.Items;
+            if (data.LastEvaluatedKey != undefined && data.LastEvaluatedKey != null) {}
+            callback(null, {
+                status: 'SUCCESS',
+                data: response,
+            });
+        }
+        else {
+            callback(new Error('post_status: ' + event.post_status + ' not found'));
+        }
+    });
+}
+
+function kyb_users(event, context, callback) {
+    if (event.user_phone_number.trim().length > 0) {
+        let checkIfUserExists = {
+            TableName: "price_drop_user",
+            IndexName: "user_phone_number-index",
+            KeyConditionExpression: "#user_phone_number = :user_phone_number",
+            ExpressionAttributeNames: {
+                "#user_phone_number": "user_phone_number",
+            },
+            ExpressionAttributeValues: {
+                ":user_phone_number": event.user_phone_number
+            }
+        };
+        queryDynamo(checkIfUserExists, callback, function(user) {
+            if (user.Items.length > 0) {
+                let UpdateExpression = 'set';
+                let ExpressionAttributeNames = {};
+                let ExpressionAttributeValues = {};
+                for (const field in event) {
+                    if (field == 'email_id' || field == 'image' || field == 'location_details' || field == 'identity_froof' || field == 'document_url' || field == 'user_type') {
+                        UpdateExpression += ` #${field} = :${field} ,`;
+                        ExpressionAttributeNames['#' + field] = field;
+                        ExpressionAttributeValues[':' + field] = event[field];
+                    }
+                }
+                UpdateExpression = UpdateExpression + 'user_type = :user_type,';
+                ExpressionAttributeValues[':user_type'] = 'BUSINESS';
+                if (UpdateExpression != 'set') {
+                    UpdateExpression = UpdateExpression.slice(0, -1);
+                    let updateInternalUserParams = {
+                        TableName: 'kyb_users',
+                        Key: {
+                            user_id: user.Items[0].user_id,
+                        },
+                        UpdateExpression: UpdateExpression,
+                        ExpressionAttributeNames: ExpressionAttributeNames,
+                        ExpressionAttributeValues: ExpressionAttributeValues,
+                        ReturnValues: 'UPDATED_NEW',
+                    };
+                    update_dynamo(updateInternalUserParams, callback, function(data) {
+                        callback(null, { status: 'Successfully', Status_Message: 'updated user details Successfully!!', data });
+                    });
+                }
+                else {
+                    callback(new Error('User with User ID: ' + event.user_id + ' cannot be updated'));
+                }
+            }
+            else {
+                callback(new Error("User With ID: " + event.user_id + " Not Found"));
+            }
+        });
+    }
+    else {
+        callback(new Error("Kindly Enter User Email ID And Name To Create User"));
+    }
+}
+
+
+exports.handler = (event, context, callback) => {
+    console.log(event);
+    switch (event.command) {
+        case 'createUser':
+            create_user(event, context, callback);
+            break;
+        case 'listUsers':
+            list_users(event, context, callback);
+            break;
+        case 'updateBmsUser':
+            update_user(event, context, callback);
+            break;
+        case 'deleteUser':
+            delete_user(event, context, callback);
+            break;
+        case 'listBmsUser':
+            list_bms_users(event, context, callback);
+            break;
+        case 'listBuyersAndSellers':
+            list_buyers_sellers(event, callback, callback);
+            break;
+        case "listPost":
+            list_post(event, context, callback);
+            break;
+        case "listPostStatus":
+            list_post_status(event, context, callback);
+            break;
+        case 'kybUser':
+            kyb_users(event, context, callback);
+            break;
+        default:
+            callback(new Error("Command not Found!"));
+    }
+};
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+let AWS = require('aws-sdk');
+var docClient = new AWS.DynamoDB.DocumentClient();
+var uuid = require("uuid");
+
+function queryDynamo(params, callback, callbackFn) {
+    docClient.query(params, function(err, data) {
+        if (err) {
+            callback(new Error(err));
+        }
+        else {
+            if (typeof callbackFn === 'function') {
+                callbackFn(data);
+            }
+        }
+    });
+}
+
+function insertIntoDynamo(params, callback, callbackFn) {
+    docClient.put(params, function(err, data) {
+        if (err) {
+            callback(new Error(err));
+        }
+        else {
+            if (typeof callbackFn === 'function') {
+                callbackFn(data);
+            }
+        }
+    });
+}
+
+const batchInsertDynamo = (params, callback, callbackFn) => {
+    docClient.batchWrite(params, function(err, data) {
+        if (err) {
+            callback(new Error(err));
+        }
+        else {
+            if (typeof callbackFn === 'function') {
+                callbackFn(data);
+            }
+        }
+    });
+};
+
+function updateDynamoRecord(params, callback, callbackFn) {
+    docClient.update(params, function(err, data) {
+        if (err) {
+            callback(new Error(err));
+        }
+        else {
+            if (typeof callbackFn === 'function') {
+                callbackFn(data);
+            }
+        }
+    });
+}
+
+
+function scanDynamo(params, callback, callbackFn) {
+    docClient.scan(params, function(err, data) {
+        if (err) {
+            callback(new Error(err));
+        }
+        else {
+            if (typeof callbackFn === 'function') {
+                callbackFn(data);
+            }
+        }
+    });
+}
+
+function delete_dynamo(params, callback, callbackFn) {
+    docClient.delete(params, function(err, data) {
+        if (err) {
+            callback(new Error(err));
+        }
+        else {
+            if (typeof callbackFn === 'function') {
+                callbackFn(data);
+            }
+        }
+    });
+}
+
+//utility fucntions
+function generate_coupon_codes(quantity, callback, callbackFn) {
+    const characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let coupon_codes = [];
+
+    function generateString(quantity, length) {
+        let coupon = "";
+        const charactersLength = characters.length;
+        for (let i = 0; i < length; i++) {
+            coupon += characters.charAt(Math.floor(Math.random() * charactersLength));
+        }
+        if (coupon_codes.indexOf(coupon.trim()) == -1) {
+            coupon_codes.push(coupon.trim());
+            quantity = quantity - 1;
+            if (quantity > 0) {
+                return generateString(quantity, length);
+            }
+            else {
+                coupon_codes = coupon_codes.map((item, index) => {
+                    item = item + "-" + Number(index + 1);
+                    return item;
+                });
+                callbackFn(coupon_codes);
+            }
+        }
+        else {
+            return generateString(quantity, 10);
+        }
+    }
+    return generateString(quantity, 10);
+}
+
+function signup_user(event, context, callback) {
+    let checkEmptyFields = true;
+    for (const field in event) {
+        if (typeof event[field] == 'string') {
+            if (event[field].trim().length == 0) {
+                checkEmptyFields = false;
+            }
+        }
+    }
+    if (checkEmptyFields) {
+        let checkIfUserExists = {
+            TableName: 'price_drop_user',
+            IndexName: 'user_phone_number-index',
+            KeyConditionExpression: '#user_phone_number = :user_phone_number',
+            ExpressionAttributeNames: { '#user_phone_number': 'user_phone_number' },
+            ExpressionAttributeValues: { ':user_phone_number': event.user_phone_number },
+        };
+        queryDynamo(checkIfUserExists, callback, function(user) {
+            console.log('user', user);
+            if (user.Count == 0) {
+                let newUserParams = {
+                    Item: {
+                        user_id: uuid.v4(),
+                        user_name: event.user_name,
+                        user_country_code: event.user_country_code,
+                        user_phone_number: event.user_phone_number,
+                        user_device_type: event.user_device_type,
+                        user_app_version: event.user_app_version,
+                        user_device_version: event.user_device_version,
+                        user_type: "INDIVIDUAL",
+                        user_status: "ACTIVE",
+                        user_created_at: Date.now(),
+                        no_of_items_purchased: 0,
+                        no_of_items_posted: 0,
+                        purchased_coupon_codes: []
+                    },
+                    TableName: 'price_drop_user',
+                    ConditionExpression: 'attribute_not_exists(user_id)',
+                    ReturnValues: 'ALL_OLD',
+                };
+                insertIntoDynamo(newUserParams, callback, function(InsertedData) {
+                    console.log('insertedData', InsertedData);
+                    callback(null, { status: 'Success', Status_Message: '  Added User Successfully!!', user_details: newUserParams.Item });
+                });
+            }
+            else {
+                callback(new Error("User Exists Already"));
+            }
+        });
+    }
+    else {
+        callback(new Error('Empty Field identified!!! Cannot Signup'));
+    }
+}
+
+function get_user_details(event, context, callback) {
+    if (event.user_phone_number.trim().length != 0) {
+        let getUserDetails = {
+            TableName: 'price_drop_user',
+            IndexName: 'user_phone_number-index',
+            KeyConditionExpression: '#user_phone_number = :user_phone_number',
+            ExpressionAttributeNames: { '#user_phone_number': 'user_phone_number' },
+            ExpressionAttributeValues: { ':user_phone_number': event.user_phone_number },
+        };
+        queryDynamo(getUserDetails, callback, function(data) {
+            if (data.Count > 0) {
+                let response = {};
+                response.items = data.Items;
+                callback(null, { status: 'SUCCESS', data: response });
+            }
+            else {
+                callback(new Error('User With phone_number ' + event.user_phone_number + ' not Found!!'));
+            }
+        });
+    }
+    else {
+        callback(new Error('Kindly Enter User phone_number to get user details'));
+    }
+}
+
+function update_user(event, context, callback) {
+    let checkEmptyFields = true;
+    for (const field in event) {
+        if (typeof event[field] == 'string') {
+            if (event[field].trim().length == 0) {
+                checkEmptyFields = false;
+            }
+        }
+    }
+    if (checkEmptyFields) {
+        let getDeviceUsersParams = {
+            TableName: "price_drop_user",
+            KeyConditionExpression: "user_id  = :user_id",
+            ExpressionAttributeValues: {
+                ":user_id": event.user_id
+            }
+        };
+        queryDynamo(getDeviceUsersParams, callback, function(user) {
+            if (user.Items.length > 0 && user.Items[0].user_phone_number == event.user_phone_number) {
+                let UpdateExpression = 'set';
+                let ExpressionAttributeNames = {};
+                let ExpressionAttributeValues = {};
+                for (const field in event) {
+                    if (field == 'user_name' || field == 'user_device_type' || field == 'user_app_version' || field == 'user_device_version' || field == 'fcm_token' || field == 'user_phone_number' || field == 'user_country_code') {
+                        UpdateExpression += ` #${field} = :${field} ,`;
+                        ExpressionAttributeNames['#' + field] = field;
+                        ExpressionAttributeValues[':' + field] = event[field];
+                    }
+                }
+                if (UpdateExpression != 'set') {
+                    UpdateExpression = UpdateExpression.slice(0, -1);
+                    let updateInternalUserParams = {
+                        TableName: 'price_drop_user',
+                        Key: {
+                            user_id: event.user_id,
+                        },
+                        UpdateExpression: UpdateExpression,
+                        ExpressionAttributeNames: ExpressionAttributeNames,
+                        ExpressionAttributeValues: ExpressionAttributeValues,
+                        ReturnValues: 'UPDATED_NEW',
+                    };
+                    updateDynamoRecord(updateInternalUserParams, callback, function(data) {
+                        callback(null, { status: 'Successfully', Status_Message: 'updated user details Successfully!!', data });
+                    });
+                }
+                else {
+                    callback(new Error('User with User ID: ' + event.user_id + ' cannot be updated'));
+                }
+            }
+            else {
+                callback(new Error("User With ID: " + event.user_id + " Not Found"));
+            }
+        });
+    }
+    else {
+        callback(new Error("Empty Fields Occcured Cannot Update User Details"));
+    }
+}
+
+
+function delete_user(event, context, callback) {
+    if (event.user_id != undefined && event.user_id.trim().length > 0) {
+        let getUserDetailsParams = {
+            TableName: "price_drop_user",
+            KeyConditionExpression: "user_id = :user_id",
+            ExpressionAttributeValues: {
+                ":user_id": event.user_id,
+            }
+        };
+        queryDynamo(getUserDetailsParams, callback, (data) => {
+            if (data.Count > 0) {
+                console.log(data);
+                let deleteUserParams = {
+                    TableName: 'price_drop_user',
+                    Key: {
+                        user_id: event.user_id,
+                    },
+                };
+                delete_dynamo(deleteUserParams, callback, function(data) {
+                    callback(null, { status: "SUCCESS", status_message: "User deleted Successfully", data });
+                });
+            }
+            else {
+                callback(new Error("Student Not Found!"));
+            }
+        });
+    }
+    else {
+        callback(new Error("Kindly! Enter User ID To be Updated"));
+    }
+}
+
+function list_user(event, context, callback) {
+    let getCoupon = {
+        TableName: 'price_drop_user',
+        ScanIndexForward: false,
+        Limit: 100,
+    };
+    scanDynamo(getCoupon, callback, function(data) {
+        if (data.Count > 0) {
+            let response = {};
+            response.items = data.Items;
+            if (data.LastEvaluatedKey != undefined && data.LastEvaluatedKey != null) {}
+            callback(null, {
+                status: 'SUCCESS',
+                data: response,
+            });
+        }
+        else {
+            callback(new Error('Currently there are No users'));
+        }
+    });
+}
+
+function create_post(event, context, callback) {
+    let checkEmptyFields = true;
+    for (const field in event) {
+        if (typeof event[field] == 'string') {
+            if (event[field].trim().length == 0) {
+                checkEmptyFields = false;
+            }
+        }
+    }
+    if (checkEmptyFields) {
+        let getDeviceUsersParams = {
+            TableName: "price_drop_user",
+            KeyConditionExpression: "user_id  = :user_id",
+            ExpressionAttributeValues: {
+                ":user_id": event.user_id
+            }
+        };
+        queryDynamo(getDeviceUsersParams, callback, function(user) {
+            if (user.Items.length > 0) {
+                let createPostParams = {
+                    Item: {
+                        post_id: uuid.v4(),
+                        post_title: event.post_title,
+                        post_body: event.post_body,
+                        price: event.price,
+                        post_image: event.post_image,
+                        post_lat: event.post_lat,
+                        post_long: event.post_long,
+                        user_country_code: user.Items[0].user_country_code,
+                        user_phone_number: user.Items[0].user_phone_number,
+                        post_address: event.post_address,
+                        post_status: "LIVE_NOW",
+                        post_quantity: event.post_quantity,
+                        post_expire_time: event.post_expire_time,
+                        original_cost: event.original_cost,
+                        discounted_cost: event.discounted_cost,
+                        user_name: user.Items[0].user_name,
+                        post_createdon: new Date().getTime()
+                    },
+                    TableName: 'price_drop_posts',
+
+                    ConditionExpression: 'attribute_not_exists(post_id)',
+                    ReturnValues: 'ALL_OLD',
+                };
+                insertIntoDynamo(createPostParams, callback, function(data) {
+                    //INSERT IN POSTGRE
+                    generate_coupon_codes(event.post_quantity, callback, function(codes) {
+                        let codesToInsert = [];
+                        while (codes.length) {
+                            codesToInsert.push(codes.splice(0, 25));
+                        }
+                        let promise_array = [];
+                        for (let i = 0; i < codesToInsert.length; i++) {
+                            promise_array.push(new Promise((res, rej) => {
+                                let batchCouponsWriteParams = {
+                                    RequestItems: {
+                                        price_drop_coupons: []
+                                    },
+                                };
+                                for (let m = 0; m < codesToInsert[i].length; m++) {
+                                    batchCouponsWriteParams.RequestItems.price_drop_coupons.push({
+                                        PutRequest: {
+                                            Item: {
+                                                post_id: createPostParams.Item.post_id,
+                                                coupon_id: codesToInsert[i][m],
+                                                coupon_status: "AVAILABLE"
+                                            }
+                                        }
+                                    });
+                                }
+                                batchInsertDynamo(batchCouponsWriteParams, callback, function(data) {
+                                    res(data);
+                                });
+                            }));
+                        }
+                        Promise.all(promise_array).then((data) => {
+                            callback(null, { status: 'Success', Status_Message: 'Created Post successfully' });
+                        });
+                    });
+                });
+            }
+            else {
+                callback(new Error("User With ID: " + event.user_id + " Not Found"));
+            }
+        });
+    }
+    else {
+        callback(new Error("Empty Fields Occcured Cannot Post A Transaction!"));
+    }
+}
+
+function list_posts_to_buy(event, context, callback) {
+    //get data from pos gre and sent
+}
+
+function delete_post(event, context, callback) {
+
+}
+
+function buy_coupon_of_post(event, context, callback) {
+    let checkEmptyFields = true;
+    for (const field in event) {
+        if (typeof event[field] == 'string') {
+            if (event[field].trim().length == 0) {
+                checkEmptyFields = false;
+            }
+        }
+    }
+    if (checkEmptyFields) {
+        let checkIfUserExistsParams = {
+            TableName: "price_drop_user",
+            KeyConditionExpression: "user_id  = :user_id",
+            ExpressionAttributeValues: {
+                ":user_id": event.user_id
+            }
+        };
+        queryDynamo(checkIfUserExistsParams, callback, function(user) {
+            if (user.Items.length > 0) {
+                let checkIfPostExistsParams = {
+                    TableName: "price_drop_posts",
+                    KeyConditionExpression: "post_id  = :post_id",
+                    FilterExpression: "post_status <> :post_status",
+                    ExpressionAttributeValues: {
+                        ":post_id": event.post_id,
+                        ':post_status': 'EXPIRED'
+                    }
+                };
+                queryDynamo(checkIfPostExistsParams, callback, function(post) {
+                    if (post.Items.length > 0) {
+                        let checkIfAvailableCouponExistsParams = {
+                            TableName: "price_drop_coupons",
+                            KeyConditionExpression: "post_id  = :post_id",
+                            FilterExpression: "coupon_status = :coupon_status",
+                            ExpressionAttributeValues: {
+                                ":post_id": event.post_id,
+                                ':coupon_status': 'AVAILABLE'
+                            }
+                        };
+                        queryDynamo(checkIfAvailableCouponExistsParams, callback, function(coupons) {
+                            if (coupons.Items.length > 0) {
+                                let createPurchaseOrderParams = {
+                                    Item: {
+                                        post_id: event.post_id,
+                                        coupon_id: coupons.Items[0].coupon_id,
+                                        user_id: event.user_id,
+                                        purchase_status: "OPEN",
+                                        transaction_id: uuid.v4()
+                                    },
+                                    TableName: 'price_drop_transactions',
+                                    ConditionExpression: 'attribute_not_exists(post_id)',
+                                    ReturnValues: 'ALL_OLD',
+                                };
+                                insertIntoDynamo(createPurchaseOrderParams, callback, function(InsertedData) {
+                                    callback(null, { status: 'Success', Status_Message: 'Purchased Coupon Successfully!!', coupon_code: coupons.Items[0].coupon_id });
+                                });
+                            }
+                            else {
+                                callback(new Error("No Available Coupons Found For This Post"));
+                            }
+                        });
+                    }
+                    else {
+                        callback(new Error("Post With ID: " + event.post_id + " Not Found"));
+                    }
+                });
+            }
+            else {
+                callback(new Error("User With ID: " + event.user_id + " Not Found"));
+            }
+        });
+    }
+    else {
+        throw new Error("Empty Fields Occured Cannot Complete the purchase");
+    }
+}
+
+function list_coupons_to_buy(event, context, callback) {
+    let getCoupon = {
+        TableName: 'price_drop_transactions',
+        ScanIndexForward: false,
+        Limit: 100,
+    };
+    scanDynamo(getCoupon, callback, function(data) {
+        if (data.Count > 0) {
+            let response = {};
+            response.items = data.Items;
+            if (data.LastEvaluatedKey != undefined && data.LastEvaluatedKey != null) {}
+            callback(null, {
+                status: 'SUCCESS',
+                data: response,
+            });
+        }
+        else {
+            callback(new Error('Currently there are No coupon'));
+        }
+    });
+}
+
+exports.handler = (event, context, callback) => {
+    console.log(event);
+    switch (event.command) {
+        case 'signUpUser':
+            signup_user(event, context, callback);
+            break;
+        case "getUserDetails":
+            get_user_details(event, context, callback);
+            break;
+        case "updateUser":
+            update_user(event, context, callback);
+            break;
+        case "listUser":
+            list_user(event, context, callback);
+            break;
+        case "createPost":
+            create_post(event, context, callback);
+            break;
+        case "listPostsToBuy":
+            list_posts_to_buy(event, context, callback);
+            break;
+        case "buyCouponOfPost":
+            buy_coupon_of_post(event, context, callback);
+            break;
+        case "listCouponstoBuy":
+            list_coupons_to_buy(event, context, callback);
+            break;
+        case "deleteUser":
+            delete_user(event, context, callback);
+            break;
+        default:
+            callback(new Error("Command not Found!"));
+    }
+};
