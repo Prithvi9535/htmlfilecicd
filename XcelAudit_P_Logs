@@ -1,0 +1,58 @@
+//ADDS PORTAL LOGS
+
+// NOHNG TO REMOVE
+
+//xcel audit portal logs
+var AWS = require('aws-sdk');
+AWS.config.update({ region: 'ap-south-1' });
+var docClient = new AWS.DynamoDB.DocumentClient();
+var uuid = require('uuid');
+exports.handler = (event, context, callback) => {
+	let currentTime = new Date();
+	let currentOffset = currentTime.getTimezoneOffset();
+	let ISTOffset = 330;
+	let created_at = new Date(currentTime.getTime() + (ISTOffset + currentOffset) * 60000);
+	//let timeStamp = created_at.getTime();
+	//var today = new Date();
+	var date = created_at.getFullYear() + '-' + (created_at.getMonth() + 1) + '-' + created_at.getDate();
+	var time = created_at.getHours() + ':' + created_at.getMinutes() + ':' + created_at.getSeconds();
+	let getOrganisationInfo = {
+		TableName: 'XcelAudit_Organisations',
+		KeyConditionExpression: '#organisation_id = :organisation_id',
+		ExpressionAttributeNames: { '#organisation_id': 'organisation_id' },
+		ExpressionAttributeValues: { ':organisation_id': event.organisation_id },
+	};
+	docClient.query(getOrganisationInfo, function(err, data) {
+		if (data) {
+			let loggingParams = {
+				Item: {
+					log_id: uuid.v4(),
+					'logged by': event.logger.substring(0, event.logger.lastIndexOf('@')),
+					'logged at date': date,
+					'logged at time': time,
+					organisation_name: data.Items[0].organisation_name,
+					organisation_id: event.organisation_id,
+					client_id: event.client_id,
+					Action: event.message,
+				},
+				TableName: 'XcelAudit_UserPortal_Logs',
+				ConditionExpression: 'attribute_not_exists(step_id)',
+				ReturnValues: 'ALL_OLD',
+			};
+			if(event.project_id != "") {
+				loggingParams.Item.project_id = event.project_id;
+			}
+			docClient.put(loggingParams, function(err, data) {
+				if (err) {
+					callback(err);
+				}
+				else {
+					callback(null, data);
+				}
+			});
+		}
+		else {
+			callback(err);
+		}
+	});
+};
