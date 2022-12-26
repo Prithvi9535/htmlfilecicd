@@ -1,0 +1,2061 @@
+var AWS = require('aws-sdk');
+AWS.config.update({ region: 'ap-south-1' });
+var docClient = new AWS.DynamoDB.DocumentClient();
+var lambda = new AWS.Lambda();
+var AWS = require('aws-sdk');
+var cognitoidentityserviceprovider = new AWS.CognitoIdentityServiceProvider({ apiVersion: '2016-04-18' });
+var uuid = require('uuid');
+var constants = require('constants.json');
+
+function invoke_lambda(payload, function_name, callbackFunction) {
+    var params = {
+        FunctionName: function_name,
+        InvocationType: 'RequestResponse',
+        Payload: JSON.stringify(payload),
+    };
+    var response = lambda.invoke(params, function(err, data) {
+        if (err) {
+            console.log(err, 'inside invoke_lambda: could not invoke: error stack: ' + err.stack);
+        }
+        else {
+            if (typeof callbackFunction == 'function') callbackFunction(data);
+        }
+    });
+}
+
+function logErrorMsg(errMsg, params, stack, callback, callbackFn) {
+    var msg = 'Lambda function name :' + process.env.AWS_LAMBDA_FUNCTION_NAME + '\n\nError message : \n' + JSON.stringify(errMsg) + '\n\nParams : \n' + JSON.stringify(params) + '\n\nStack : \n' + JSON.stringify(stack) + '\n\n Cloudwatch stream :' + process.env.AWS_LAMBDA_LOG_STREAM_NAME;
+    invoke_lambda({ message: msg }, 'XcelAudit_B_P_ErrorLogs', function(data) {
+        callback(errMsg);
+    });
+}
+
+// function auditLog(logger, message, callbackFunction) {
+//     var params = {
+//         FunctionName: "Xcel_Audit_BMS_Logs",
+//         InvocationType: 'RequestResponse',
+//         Payload: JSON.stringify({ logger: logger, message: message })
+//     };
+//     var response = lambda.invoke(params, function(err, data) {
+//         if (err) {
+//             console.log(err, 'inside invoke_lambda: could not invoke: error stack: ' + err.stack);
+//         }
+//         else {
+//             if (typeof callbackFunction == "function")
+//                 callbackFunction(data);
+//         }
+//     });
+// }
+
+function auditLog(logger, message, callbackFunction) {
+    let loggingParams = {
+        Item: {
+            log_id: uuid.v4(),
+            logged_by: logger.substring(0, logger.lastIndexOf('@')),
+            logged_at: Date.now(),
+            action: message,
+        },
+        TableName: 'XcelAudit_BMS_Logs',
+        ConditionExpression: 'attribute_not_exists(log_id)',
+        ReturnValues: 'ALL_OLD',
+    };
+    insertIntoDynamo(loggingParams, null, function(InsertedData) {
+        callbackFunction(InsertedData);
+    });
+}
+
+function queryDynamo(params, callback, callbackFn) {
+    docClient.query(params, function(err, data) {
+        if (err) {
+            logErrorMsg(err, params, err.stack, callback, function(data) {
+                callback(err);
+            });
+        }
+        else {
+            if (typeof callbackFn === 'function') {
+                callbackFn(data);
+            }
+        }
+    });
+}
+
+function insertIntoDynamo(params, callback, callbackFn) {
+    docClient.put(params, function(err, data) {
+        if (err) {
+            logErrorMsg(err, params, err.stack, callback, function(data) {
+                callback(err);
+            });
+        }
+        else {
+            if (typeof callbackFn === 'function') {
+                callbackFn(data);
+            }
+        }
+    });
+}
+
+function updateDynamoRecord(params, callback, callbackFn) {
+    docClient.update(params, function(err, data) {
+        if (err) {
+            logErrorMsg(err, params, err.stack, callback, function(data) {
+                callback(err);
+            });
+        }
+        else {
+            if (typeof callbackFn === 'function') {
+                callbackFn(data);
+            }
+        }
+    });
+}
+
+function deleteFromDynamo(params, callback, callbackFn) {
+    docClient.delete(params, function(err, data) {
+        if (err) {
+            logErrorMsg(err, params, err.stack, callback, function(data) {
+                callback(err);
+            });
+        }
+        else {
+            if (typeof callbackFn === 'function') {
+                callbackFn(data);
+            }
+        }
+    });
+}
+
+function scanDynamo(params, callback, callbackFn) {
+    docClient.scan(params, function(err, data) {
+        if (err) {
+            logErrorMsg(err, params, err.stack, callback, function(data) {
+                callback(err);
+            });
+        }
+        else {
+            if (typeof callbackFn === 'function') {
+                callbackFn(data);
+            }
+        }
+    });
+}
+
+function createCognitoUser(email_id, poolId, callback, callbackFn) {
+    var params = {
+        UserPoolId: poolId,
+        Username: email_id.trim().toLowerCase(),
+        UserAttributes: [{
+                Name: 'email',
+                Value: email_id.trim().toLowerCase(),
+            },
+            {
+                Name: 'email_verified',
+                Value: 'true',
+            },
+        ],
+        TemporaryPassword: (+Date.now()).toString(32),
+    };
+    cognitoidentityserviceprovider.adminCreateUser(params, function(err, data) {
+        if (!err) {
+            callbackFn(data);
+        }
+        else {
+            logErrorMsg(err, params, null, callback, function(data) {
+                callback(new Error('Unable to create Cognito Account with Email_ID : ' + email_id.toLowerCase()));
+            });
+        }
+    });
+}
+
+function createUser(event, context, callback) {
+    let checkEmptyFields = true;
+    for (const field in event) {
+        if (typeof event[field] == 'string') {
+            if (event[field].trim().length == 0) {
+                checkEmptyFields = false;
+            }
+        }
+    }
+    if (checkEmptyFields) {
+        let checkIfUserExists = {
+            TableName: 'XcelAudit_BMS_Users',
+            IndexName: 'user_email_id-index',
+            KeyConditionExpression: '#user_email_id = :user_email_id',
+            ExpressionAttributeNames: { '#user_email_id': 'user_email_id' },
+            ExpressionAttributeValues: { ':user_email_id': event.user_email_id.toLowerCase() },
+        };
+        queryDynamo(checkIfUserExists, callback, function(User) {
+            if (User.Count == 0) {
+                let newUserParams = {
+                    Item: {
+                        user_id: uuid.v4(),
+                        user_name: event.user_name,
+                        user_email_id: event.user_email_id,
+                        user_mobile_number: event.user_mobile_number,
+                        user_country_code: event.user_country_code,
+                        user_type: event.user_type,
+                        user_status: event.user_status,
+                        created_at: Date.now(),
+                        creater_email_id: event.creater_email_id,
+                    },
+                    TableName: 'XcelAudit_BMS_Users',
+                    ConditionExpression: 'attribute_not_exists(user_id)',
+                    ReturnValues: 'ALL_OLD',
+                };
+                createCognitoUser(event.user_email_id, constants.BmsPortalCognitoPool, callback, function(cognitodata) {
+                    insertIntoDynamo(newUserParams, callback, function(InsertedData) {
+                        auditLog(event.creater_email_id.trim(), 'Create User', function(value) {
+                            callback(null, { status: 'Success', Status_Message: '  Added User Successfully!!' });
+                        });
+                    });
+                });
+            }
+            else {
+                callback(new Error('User Exists with the given email id'));
+            }
+        });
+    }
+    else {
+        callback(new Error('Empty Field identified!!! user not created'));
+    }
+}
+
+function listUsers(event, context, callback) {
+
+    let getUsers = {
+        TableName: 'XcelAudit_BMS_Users',
+        ScanIndexForward: false,
+        Limit: 100,
+    };
+    if (event.next_token != null && event.next_token != undefined) {
+        getUsers.ExclusiveStartKey = JSON.parse(Buffer.from(event.next_token, 'base64').toString('ascii'));
+    }
+    scanDynamo(getUsers, callback, function(data) {
+        if (data.Count > 0) {
+            let response = {};
+            response.items = data.Items;
+            if (data.LastEvaluatedKey != undefined && data.LastEvaluatedKey != null) {
+                response.next_token = Buffer.from(JSON.stringify(data.LastEvaluatedKey)).toString('base64');
+            }
+            callback(null, {
+                status: 'SUCCESS',
+                data: response,
+            });
+        }
+        else {
+            callback(new Error('Currently there are No Users Created'));
+        }
+    });
+}
+
+function updateUser(event, context, callback) {
+    if (event.user_id.trim().length != 0) {
+        let checkIfUserExists = {
+            TableName: 'XcelAudit_BMS_Users',
+            IndexName: 'user_id-index',
+            KeyConditionExpression: '#user_id = :user_id',
+            ExpressionAttributeNames: { '#user_id': 'user_id' },
+            ExpressionAttributeValues: { ':user_id': event.user_id },
+        };
+        queryDynamo(checkIfUserExists, callback, function(user) {
+            if (user.Count > 0) {
+                let UpdateExpression = 'set';
+                let ExpressionAttributeNames = {};
+                let ExpressionAttributeValues = {};
+                for (const field in event) {
+                    if (field == "user_country_code" || field == 'user_mobile_number' || field == 'user_name' || field == 'user_status' || field == 'user_type') {
+                        if (event[field].trim().length != 0) {
+                            UpdateExpression += ` #${field} = :${field} ,`;
+                            ExpressionAttributeNames['#' + field] = field;
+                            ExpressionAttributeValues[':' + field] = event[field];
+                        }
+                        else {
+                            callback(new Error(field + ' cannot be updated to empty value'));
+                        }
+                    }
+                }
+                if (UpdateExpression != 'set') {
+                    UpdateExpression = UpdateExpression.slice(0, -1);
+                    let updateLocationParams = {
+                        TableName: 'XcelAudit_BMS_Users',
+                        Key: {
+                            user_id: event.user_id,
+                            created_at: user.Items[0].created_at,
+                        },
+                        UpdateExpression: UpdateExpression,
+                        ExpressionAttributeNames: ExpressionAttributeNames,
+                        ExpressionAttributeValues: ExpressionAttributeValues,
+                        ReturnValues: 'UPDATED_NEW',
+                    };
+                    updateDynamoRecord(updateLocationParams, callback, function(data) {
+                        auditLog(event.creater_email_id.trim(), 'Update User', function(value) {
+                            callback(null, { status: 'Success', Status_Message: ' updated user Successfully!!' });
+                        });
+                    });
+                }
+                else {
+                    callback(new Error('User Cannot be updated !!!'));
+                }
+            }
+            else {
+                callback(new Error('User Not Found !!!'));
+            }
+        });
+    }
+    else {
+        callback(new Error('Kindly, Enter User_ID to update user'));
+    }
+}
+
+function createOrganisation(event, context, callback) {
+    let checkEmptyFields = true;
+    for (const field in event) {
+        if (typeof event[field] == 'string') {
+            if (event[field].trim().length == 0) {
+                checkEmptyFields = false;
+            }
+        }
+    }
+    if (checkEmptyFields) {
+        let checkIfOrganisationExists = {
+            TableName: 'XcelAudit_Organisations',
+            IndexName: 'organisation_code-index',
+            KeyConditionExpression: '#organisation_code = :organisation_code',
+            ExpressionAttributeNames: { '#organisation_code': 'organisation_code' },
+            ExpressionAttributeValues: { ':organisation_code': event.organisation_code.toLowerCase() },
+        };
+        queryDynamo(checkIfOrganisationExists, callback, function(organisation) {
+            if (organisation.Count == 0) {
+                let newOrganisationParams = {
+                    Item: {
+                        organisation_id: uuid.v4(),
+                        organisation_name: event.organisation_name,
+                        organisation_code: event.organisation_code,
+                        organisation_adress: event.organisation_adress,
+                        organisation_state: event.organisation_state,
+                        organisation_country: event.organisation_country,
+                        organisation_zip_code: event.organisation_zip_code,
+                        organisation_data_center: event.organisation_data_center,
+                        organisation_person_name: event.organisation_person_name,
+                        organisation_person_emailid: event.organisation_person_emailid.toLowerCase(),
+                        organisation_person_contact: event.organisation_person_contact,
+                        organisation_person_country_code: event.organisation_person_country_code,
+                        organisation_status: 'ACTIVE',
+                        created_on: Date.now(),
+                        creater_email_id: event.creater_email_id,
+                        clients: [],
+                    },
+                    TableName: 'XcelAudit_Organisations',
+                    ConditionExpression: 'attribute_not_exists(organisation_id)',
+                    ReturnValues: 'ALL_OLD',
+                };
+                createCognitoUser(event.organisation_person_emailid, constants.userPortalCognitoPool, callback, function(cognitodata) {
+                    insertIntoDynamo(newOrganisationParams, callback, function(InsertedData) {
+                        let fixedRoleParams = {
+                            Item: {
+                                role_id: uuid.v4(),
+                                role_name: 'ADMIN',
+                                role_status: 'ACTIVE',
+                                role_description: 'This Role is Mandatory',
+                                organisation_id: newOrganisationParams.Item.organisation_id,
+                                organisation_name: newOrganisationParams.Item.organisation_name,
+                                creater_email_id: event.organisation_person_emailid,
+                            },
+                            TableName: 'XcelAudit_Roles',
+                            ConditionExpression: 'attribute_not_exists(role_id)',
+                            ReturnValues: 'ALL_OLD',
+                        };
+                        insertIntoDynamo(fixedRoleParams, callback, function(roledata) {
+                            let fixedRole2Params = {
+                                Item: {
+                                    role_id: uuid.v4(),
+                                    role_name: 'MEMBER',
+                                    role_status: 'ACTIVE',
+                                    role_description: 'This Role is Mandatory',
+                                    organisation_id: newOrganisationParams.Item.organisation_id,
+                                    organisation_name: newOrganisationParams.Item.organisation_name,
+                                    creater_email_id: event.organisation_person_emailid,
+                                },
+                                TableName: 'XcelAudit_Roles',
+                                ConditionExpression: 'attribute_not_exists(role_id)',
+                                ReturnValues: 'ALL_OLD',
+                            };
+                            insertIntoDynamo(fixedRole2Params, callback, function(roledata) {
+                                let newUserParams = {
+                                    Item: {
+                                        user_id: uuid.v4(),
+                                        user_system_status: 'ACTIVE',
+                                        user_status: 'SUPER_ADMIN',
+                                        role_id: fixedRoleParams.Item.role_id,
+                                        role_name: fixedRoleParams.Item.role_name,
+                                        user_type: 'INTERNAL',
+                                        projects: [],
+                                        user_name: event.organisation_person_name,
+                                        user_email_id: event.organisation_person_emailid,
+                                        contact_number: newOrganisationParams.Item.organisation_person_contact,
+                                        country_code: newOrganisationParams.Item.organisation_person_country_code,
+                                        organisation_id: newOrganisationParams.Item.organisation_id,
+                                        organisation_details: newOrganisationParams.Item,
+                                        no_of_pending_queries: 0,
+                                    },
+                                    TableName: 'XcelAudit_UserPortal_Users',
+                                    ConditionExpression: 'attribute_not_exists(organisation_id)',
+                                    ReturnValues: 'ALL_OLD',
+                                };
+                                insertIntoDynamo(newUserParams, callback, function(InsertedData) {
+                                    auditLog(event.creater_email_id.trim(), 'Create Organisation', function(value) {
+                                        callback(null, { status: 'Success', Status_Message: 'Organisation  Added Successfully!!' });
+                                    });
+                                });
+                            });
+                        });
+                    });
+                });
+            }
+            else {
+                callback(new Error('Organisation Exists with the given organisation code'));
+            }
+        });
+    }
+    else {
+        callback(new Error('Empty Field Incurred cannot create Organisation'));
+    }
+}
+
+function listOrganisations(event, context, callback) {
+    let getOrganisations = {
+        TableName: 'XcelAudit_Organisations',
+        ScanIndexForward: false,
+        Limit: 100,
+    };
+    if (event.next_token != null && event.next_token != undefined) {
+        getOrganisations.ExclusiveStartKey = JSON.parse(Buffer.from(event.next_token, 'base64').toString('ascii'));
+    }
+    scanDynamo(getOrganisations, callback, function(data) {
+        if (data.Count > 0) {
+            let response = {};
+            response.items = data.Items;
+            if (data.LastEvaluatedKey != undefined && data.LastEvaluatedKey != null) {
+                response.next_token = Buffer.from(JSON.stringify(data.LastEvaluatedKey)).toString('base64');
+            }
+
+            callback(null, {
+                status: 'SUCCESS',
+                data: response,
+            });
+        }
+        else {
+            callback(new Error('Currently there are No Organisations created'));
+        }
+    });
+}
+
+function updateOrganisation(event, context, callback) {
+    if (event.organisation_id.trim().length != 0) {
+        let checkIfOrganisationExists = {
+            TableName: 'XcelAudit_Organisations',
+            KeyConditionExpression: '#organisation_id = :organisation_id',
+            ExpressionAttributeNames: { '#organisation_id': 'organisation_id' },
+            ExpressionAttributeValues: { ':organisation_id': event.organisation_id },
+        };
+        queryDynamo(checkIfOrganisationExists, callback, function(organisation) {
+            if (organisation.Count > 0) {
+                let UpdateExpression = 'set';
+                let ExpressionAttributeNames = {};
+                let ExpressionAttributeValues = {};
+                for (const field in event) {
+                    if (field == 'organisation_id' || field == 'creater_email_id' || field == 'command' || field == 'created_on' || field == 'organisation_person_emailid') {
+                        continue;
+                    }
+                    else {
+                        if (event[field].trim().length != 0) {
+                            UpdateExpression += ` #${field} = :${field} ,`;
+                            ExpressionAttributeNames['#' + field] = field;
+                            ExpressionAttributeValues[':' + field] = event[field];
+                        }
+                        else {
+                            callback(new Error(field + ' cannot be updated to empty value'));
+                        }
+                    }
+                }
+
+                if (UpdateExpression != 'set') {
+                    UpdateExpression = UpdateExpression.slice(0, -1);
+                    //,created_on: organisation.Items[0].created_on,
+                    let updateLocationParams = {
+                        TableName: 'XcelAudit_Organisations',
+                        Key: {
+                            organisation_id: event.organisation_id
+                        },
+                        UpdateExpression: UpdateExpression,
+                        ExpressionAttributeNames: ExpressionAttributeNames,
+                        ExpressionAttributeValues: ExpressionAttributeValues,
+                        ReturnValues: 'UPDATED_NEW',
+                    };
+                    updateDynamoRecord(updateLocationParams, callback, function(data) {
+                        auditLog(event.creater_email_id.trim(), 'Update Organisation', function(value) {
+                            callback(null, { status: 'Success', Status_Message: ' updated Organisation Successfully!!' });
+                        });
+                    });
+                }
+                else {
+                    callback(new Error('Organisation Cannot be updated !!!'));
+                }
+            }
+            else {
+                callback(new Error('Organisation Not Found !!!'));
+            }
+        });
+    }
+    else {
+        callback(new Error('Kindly, Enter Organisation ID to update organisation'));
+    }
+}
+
+function createCategory(event, context, callback) {
+    let checkEmptyFields = true;
+    for (const field in event) {
+        if (typeof event[field] == 'string') {
+            if (event[field].trim().length == 0) {
+                checkEmptyFields = false;
+            }
+        }
+    }
+    if (checkEmptyFields) {
+        let checkIfCategoryExists = {
+            TableName: 'XcelAudit_Categories',
+            IndexName: 'category_name-index',
+            KeyConditionExpression: '#category_name = :category_name',
+            ExpressionAttributeNames: { '#category_name': 'category_name' },
+            ExpressionAttributeValues: { ':category_name': event.category_name },
+        };
+        queryDynamo(checkIfCategoryExists, callback, function(data) {
+            if (data.Count == 0) {
+                let newCategoryParams = {
+                    Item: {
+                        category_id: uuid.v4(),
+                        category_name: event.category_name,
+                        creater_email_id: event.creater_email_id,
+                        sub_categories: {},
+                    },
+                    TableName: 'XcelAudit_Categories',
+                    ConditionExpression: 'attribute_not_exists(category_id)',
+                    ReturnValues: 'ALL_OLD',
+                };
+                insertIntoDynamo(newCategoryParams, callback, function(InsertedData) {
+                    auditLog(event.creater_email_id.trim(), 'Create Category', function(value) {
+                        callback(null, { status: 'Success', Status_Message: 'Category Added Successfully!!' });
+                    });
+                });
+            }
+            else {
+                callback(new Error('Category' + event.category_name + ' already exists!'));
+            }
+        });
+    }
+    else {
+        callback(new Error('Empty Fields Found!!! Cannot create category'));
+    }
+}
+
+function listCategories(event, context, callback) {
+    let getCategories = {
+        TableName: 'XcelAudit_Categories',
+        ScanIndexForward: false,
+        Limit: 100,
+    };
+    if (event.next_token != null && event.next_token != undefined) {
+        getCategories.ExclusiveStartKey = JSON.parse(Buffer.from(event.next_token, 'base64').toString('ascii'));
+    }
+    scanDynamo(getCategories, callback, function(data) {
+        if (data.Count > 0) {
+            let response = {};
+            data.Items.map(category => {
+                if (category.sub_categories != undefined) {
+                    for (let i = 0; i < Object.keys(category.sub_categories).length; i++) {
+                        category.sub_categories[Object.keys(category.sub_categories)[i]].category_id = category.category_id;
+                    }
+                }
+            });
+            response.items = data.Items;
+            if (data.LastEvaluatedKey != undefined && data.LastEvaluatedKey != null) {
+                response.next_token = Buffer.from(JSON.stringify(data.LastEvaluatedKey)).toString('base64');
+            }
+            callback(null, {
+                status: 'SUCCESS',
+                data: response,
+            });
+        }
+        else {
+            // callback(null, {
+            //     status: 'SUCCESS',
+            //     data: data.Items,
+            // });
+            callback(new Error("Currently There Are No Categories To List"));
+        }
+    });
+}
+
+function updateCategory(event, context, callback) {
+    let checkEmptyFields = true;
+    for (const field in event) {
+        if (typeof event[field] == 'string') {
+            if (event[field].trim().length == 0) {
+                checkEmptyFields = false;
+            }
+        }
+    }
+    if (checkEmptyFields) {
+        let checkIfCategoryExists = {
+            TableName: 'XcelAudit_Categories',
+            KeyConditionExpression: '#category_id = :category_id',
+            ExpressionAttributeNames: { '#category_id': 'category_id' },
+            ExpressionAttributeValues: { ':category_id': event.category_id },
+        };
+        queryDynamo(checkIfCategoryExists, callback, function(category) {
+            if (category.Count > 0) {
+                let UpdateExpression = 'set';
+                let ExpressionAttributeNames = {};
+                let ExpressionAttributeValues = {};
+                for (const field in event) {
+                    if (field == 'category_name' || field == 'category_description') {
+                        if (event[field].trim().length != 0) {
+                            UpdateExpression += ` #${field} = :${field} ,`;
+                            ExpressionAttributeNames['#' + field] = field;
+                            ExpressionAttributeValues[':' + field] = event[field];
+                        }
+                        else {
+                            callback(new Error(field + ' cannot be updated to empty value'));
+                        }
+                    }
+                }
+                if (UpdateExpression != 'set') {
+                    UpdateExpression = UpdateExpression.slice(0, -1);
+                    let updateCategoryParams = {
+                        TableName: 'XcelAudit_Categories',
+                        Key: {
+                            category_id: event.category_id,
+                        },
+                        UpdateExpression: UpdateExpression,
+                        ExpressionAttributeNames: ExpressionAttributeNames,
+                        ExpressionAttributeValues: ExpressionAttributeValues,
+                        ReturnValues: 'UPDATED_NEW',
+                    };
+                    updateDynamoRecord(updateCategoryParams, callback, function(data) {
+                        auditLog(event.creater_email_id.trim(), 'Updated Category', function(value) {
+                            callback(null, { status: 'Success', Status_Message: ' updated categories Successfully!!' });
+                        });
+                    });
+                }
+                else {
+                    callback(new Error('Categories Cannot be updated !!!'));
+                }
+            }
+            else {
+                callback(new Error('Categories Not Found For The Given category ID : ' + event.category_id));
+            }
+        });
+    }
+    else {
+        callback(new Error("Empty Field Incurred!! Can't update Category"));
+    }
+}
+
+function deleteCategory(event, context, callback) {
+    if (event.category_id.trim().length != 0) {
+        let checkIfCategoryExists = {
+            TableName: 'XcelAudit_Categories',
+            KeyConditionExpression: '#category_id = :category_id',
+            ExpressionAttributeNames: { '#category_id': 'category_id' },
+            ExpressionAttributeValues: { ':category_id': event.category_id },
+        };
+        queryDynamo(checkIfCategoryExists, callback, function(category) {
+            if (category.Count > 0) {
+                var deleteCategoryParams = {
+                    TableName: 'XcelAudit_Categories',
+                    Key: {
+                        category_id: event.category_id,
+                    },
+                };
+                deleteFromDynamo(deleteCategoryParams, callback, function(data) {
+                    auditLog(event.creater_email_id.trim(), 'Deleted Category', function(value) {
+                        callback(null, { status: 'Success', Status_Message: ' deleted category Successfully!!' });
+                    });
+                });
+            }
+            else {
+                callback(new Error("Category Not Found!!!"));
+            }
+        });
+    }
+    else {
+        callback(new Error('Kindly, Enter stage ID to delete category'));
+    }
+}
+
+function createSubCategory(event, context, callback) {
+    let checkEmptyFields = true;
+    for (const field in event) {
+        if (typeof event[field] == 'string') {
+            if (event[field].trim().length == 0) {
+                checkEmptyFields = false;
+            }
+        }
+    }
+    if (checkEmptyFields) {
+        let checkIfCategoryExists = {
+            TableName: 'XcelAudit_Categories',
+            KeyConditionExpression: '#category_id = :category_id',
+            ExpressionAttributeNames: { '#category_id': 'category_id' },
+            ExpressionAttributeValues: { ':category_id': event.category_id },
+        };
+        queryDynamo(checkIfCategoryExists, callback, function(data) {
+            if (data.Count > 0) {
+                let new_sub_category = event.sub_category_name;
+                let subCategoryDoesNotExist = true;
+                let sub_categories = data.Items[0].sub_categories;
+                for (const key in sub_categories) {
+                    if (key === new_sub_category) {
+                        subCategoryDoesNotExist = false;
+                        break;
+                    }
+                }
+                if (subCategoryDoesNotExist) {
+                    sub_categories[new_sub_category] = {};
+                    let new_sub_categories = sub_categories;
+                    new_sub_categories[new_sub_category].sub_category_id = uuid.v4();
+                    new_sub_categories[new_sub_category].sub_category_name = event.sub_category_name;
+                    let addSubCategoryParams = {
+                        TableName: 'XcelAudit_Categories',
+                        Key: {
+                            category_id: event.category_id,
+                        },
+                        UpdateExpression: 'set #sub_categories =:sub_categories',
+                        ExpressionAttributeNames: { '#sub_categories': 'sub_categories' },
+                        ExpressionAttributeValues: { ':sub_categories': new_sub_categories },
+                        ReturnValues: 'UPDATED_NEW',
+                    };
+                    updateDynamoRecord(addSubCategoryParams, callback, function(data) {
+                        auditLog(event.creater_email_id.trim(), 'Added Sub Category', function(value) {
+                            callback(null, { status: 'Success', Status_Message: ' Added Sub Category successfully!!' });
+                        });
+                    });
+                }
+                else {
+                    callback(new Error('Sub Category: ' + new_sub_category + ' already exists'));
+                }
+            }
+            else {
+                callback(new Error('Category with category_id ' + event.category_id + ' not found!'));
+            }
+        });
+    }
+    else {
+        callback(new Error('Empty Fields Found!!! Cannot create sub category'));
+    }
+}
+
+function listSubCategories(event, context, callback) {
+    if (event.category_id.trim().length != 0) {
+        let checkIfCategoryExists = {
+            TableName: 'XcelAudit_Categories',
+            KeyConditionExpression: '#category_id = :category_id',
+            ExpressionAttributeNames: { '#category_id': 'category_id' },
+            ExpressionAttributeValues: { ':category_id': event.category_id },
+        };
+        queryDynamo(checkIfCategoryExists, callback, function(data) {
+            if (data.Count > 0) {
+                callback(null, { status: 'SUCCESS', data: data.Items[0].sub_categories });
+            }
+            else {
+                callback(new Error('Category with category_id ' + event.category_id + ' not found!'));
+            }
+        });
+    }
+    else {
+        callback(new Error('Kindly, Enter category id'));
+    }
+}
+
+function updateSubCategory(event, context, callback) {
+    let checkEmptyFields = true;
+    for (const field in event) {
+        if (typeof event[field] == 'string') {
+            if (event[field].trim().length == 0) {
+                checkEmptyFields = false;
+            }
+        }
+    }
+    if (checkEmptyFields) {
+        let checkIfCategoryExists = {
+            TableName: 'XcelAudit_Categories',
+            KeyConditionExpression: '#category_id = :category_id',
+            ExpressionAttributeNames: { '#category_id': 'category_id' },
+            ExpressionAttributeValues: { ':category_id': event.category_id },
+        };
+        queryDynamo(checkIfCategoryExists, callback, function(data) {
+            if (data.Count > 0) {
+                let actual_subCategories = {};
+                for (let element in data.Items[0].sub_categories) {
+                    let single_sub_category = data.Items[0].sub_categories[element];
+                    for (let element in single_sub_category) {
+                        if (element == 'sub_category_id' && single_sub_category[element] == event.sub_category_id) {
+                            if (event.sub_category_name != null) {
+                                actual_subCategories[event.sub_category_name] = {};
+                                actual_subCategories[event.sub_category_name].sub_category_name = event.sub_category_name;
+                                actual_subCategories[event.sub_category_name].sub_category_id = event.sub_category_id;
+                            }
+                            else if (event.sub_category_description != null) {
+                                actual_subCategories[single_sub_category.sub_category_name] = single_sub_category;
+                            }
+                        }
+                        if (element == 'sub_category_id' && single_sub_category[element] != event.sub_category_id) {
+                            actual_subCategories[single_sub_category.sub_category_name] = single_sub_category;
+                        }
+                    }
+                }
+                let addSubCategoryParams = {
+                    TableName: 'XcelAudit_Categories',
+                    Key: {
+                        category_id: event.category_id,
+                    },
+                    UpdateExpression: 'set #sub_categories =:sub_categories',
+                    ExpressionAttributeNames: { '#sub_categories': 'sub_categories' },
+                    ExpressionAttributeValues: { ':sub_categories': actual_subCategories },
+                    ReturnValues: 'UPDATED_NEW',
+                };
+                updateDynamoRecord(addSubCategoryParams, callback, function(data) {
+                    auditLog(event.creater_email_id.trim(), 'Updated Sub Category', function(data) {
+                        callback(null, { status: 'Success', Status_Message: ' Updated Sub Category successfully!!' });
+                    });
+                });
+            }
+            else {
+                callback(new Error('Empty Fields Found!!! Cannot create sub category'));
+            }
+        });
+    }
+    else {
+        callback(new Error('Empty Fields Found!!! Cannot create sub category'));
+    }
+}
+
+function deleteSubCategory(event, context, callback) {
+    if (event.category_id.trim().length != 0 && event.sub_category_id.trim().length != 0) {
+        let checkIfCategoryExists = {
+            TableName: 'XcelAudit_Categories',
+            KeyConditionExpression: '#category_id = :category_id',
+            ExpressionAttributeNames: { '#category_id': 'category_id' },
+            ExpressionAttributeValues: { ':category_id': event.category_id },
+        };
+        queryDynamo(checkIfCategoryExists, callback, function(category) {
+            if (category.Count > 0) {
+                let actual_subCategories = {};
+                for (let element in category.Items[0].sub_categories) {
+                    let single_sub_category = category.Items[0].sub_categories[element];
+                    let toBeDeleted = false;
+                    for (let element in single_sub_category) {
+                        if (element == 'sub_category_id' && single_sub_category[element] == event.sub_category_id) {
+                            toBeDeleted = true;
+                        }
+                    }
+                    if (!toBeDeleted) {
+                        actual_subCategories[single_sub_category.sub_category_name] = single_sub_category;
+                    }
+                }
+                if (Object.keys(category.Items[0].sub_categories).length > Object.keys(actual_subCategories).length) {
+                    let updateCategoriesParams = {
+                        TableName: 'XcelAudit_Categories',
+                        Key: {
+                            category_id: event.category_id,
+                        },
+                        UpdateExpression: 'set #sub_categories =:sub_categories',
+                        ExpressionAttributeNames: { '#sub_categories': 'sub_categories' },
+                        ExpressionAttributeValues: { ':sub_categories': actual_subCategories },
+                        ReturnValues: 'UPDATED_NEW',
+                    };
+                    updateDynamoRecord(updateCategoriesParams, callback, function(data) {
+                        auditLog(event.creater_email_id.trim(), 'Deleted Sub Category', function(data) {
+                            callback(null, { status: 'Success', Status_Message: ' Deleted Sub Category successfully!!' });
+                        });
+                    });
+                }
+                else {
+                    callback(new Error('Sub Category Not Found with the given sub category id : ' + event.sub_category_id));
+                }
+            }
+            else {
+                callback(new Error('No Category Found for the given category id : ' + event.category_id));
+            }
+        });
+    }
+    else {
+        callback(new Error('Kindly, Enter category ID and Sub category ID to delete category'));
+    }
+}
+
+function createAuditStep(event, context, callback) {
+    let checkEmptyFields = true;
+    for (const field in event) {
+        if (typeof event[field] == 'string') {
+            if (event[field].trim().length == 0) {
+                checkEmptyFields = false;
+            }
+        }
+    }
+    if (checkEmptyFields) {
+        let checkIfAuditStepExists = {
+            TableName: 'XcelAudit_AuditSteps',
+            IndexName: 'step_name-index',
+            KeyConditionExpression: '#step_name = :step_name and #creater_email_id = :creater_email_id ',
+            ExpressionAttributeNames: {
+                '#step_name': 'step_name',
+                '#creater_email_id': 'creater_email_id',
+            },
+            ExpressionAttributeValues: {
+                ':step_name': event.step_name,
+                ':creater_email_id': event.creater_email_id,
+            },
+        };
+        queryDynamo(checkIfAuditStepExists, callback, function(auditStep) {
+            if (auditStep.Count == 0) {
+                let checkIfCategoryExists = {
+                    TableName: 'XcelAudit_Categories',
+                    KeyConditionExpression: '#category_id = :category_id',
+                    ExpressionAttributeNames: { '#category_id': 'category_id' },
+                    ExpressionAttributeValues: { ':category_id': event.selected_category_id },
+                };
+                queryDynamo(checkIfCategoryExists, callback, function(category) {
+                    if (category.Count > 0) {
+                        let subcategoryExists = false;
+                        let subCategoryName = '';
+                        console.log("subCategoryName", subCategoryName);
+                        for (let subcategory in category.Items[0].sub_categories) {
+                            console.log("subcategory", subcategory);
+                            let single_sub_category = category.Items[0].sub_categories[subcategory];
+                            for (let single_element in single_sub_category) {
+                                console.log("single_element", single_element);
+                                if (single_element == 'sub_category_id' && single_sub_category[single_element] == event.selected_sub_category_id) {
+                                    subcategoryExists = true;
+                                    subCategoryName = single_sub_category['sub_category_name'];
+                                    break;
+                                }
+                            }
+                            if (subcategoryExists) {
+                                break;
+                            }
+                        }
+                        if (subcategoryExists) {
+                            let form_check = false;
+                            let checklist_check = false;
+                            let newAuditStepsParams = {
+                                Item: {
+                                    step_id: uuid.v4(),
+                                    audit_id: event.audit_id,
+                                    step_name: event.step_name,
+                                    step_description: event.step_description,
+                                    step_status: event.step_status,
+                                    selected_category_id: event.selected_category_id,
+                                    selected_category_name: category.Items[0].category_name,
+                                    selected_sub_category_id: event.selected_sub_category_id,
+                                    selected_sub_category_name: subCategoryName,
+                                    work_load_weightage: event.work_load_weightage,
+                                    work_docs_type: event.work_docs_type,
+                                    conditionally_applicable: event.conditionally_applicable,
+                                    conditionally_applicable_value: event.conditionally_applicable_value,
+                                    creater_email_id: event.creater_email_id,
+                                    ep_review: event.ep_review,
+                                    qcp_review: event.qcp_review,
+                                },
+                                TableName: 'XcelAudit_AuditSteps',
+                                ConditionExpression: 'attribute_not_exists(step_id)',
+                                ReturnValues: 'ALL_OLD',
+                            };
+                            if (event.form_id != undefined) {
+                                form_check = true;
+                                newAuditStepsParams.Item.form_id = event.form_id;
+                                newAuditStepsParams.Item.form_name = event.form_name;
+                                newAuditStepsParams.Item.form_rule_configured = false;
+                                newAuditStepsParams.Item.form_configured = true;
+                                newAuditStepsParams.Item.s3_key = 'xcel-audit-documents/AuditForms/' + event.form_id;
+                            }
+
+                            if (event.check_list_id != undefined) {
+                                newAuditStepsParams.Item.check_list_id = event.check_list_id;
+                                newAuditStepsParams.Item.check_list_name = event.check_list_name;
+                                newAuditStepsParams.Item.check_list__rule_configured = false;
+                                newAuditStepsParams.Item.check_list_configured = true;
+                                newAuditStepsParams.Item.s3_key = 'xcel-audit-documents/Checklists/' + event.check_list_id;
+                            }
+
+                            if (event.excel_template != undefined) {
+                                newAuditStepsParams.Item.excel_template = event.excel_template;
+                            }
+                            if (event.excel_template_url != undefined) {
+                                newAuditStepsParams.Item.excel_template_url = event.excel_template_url;
+                            }
+
+                            // if (event.form_based_step == undefined && event.check_list_id == undefined) {
+                            //     insertIntoDynamo(newAuditStepsParams, callback, function(InsertedData) {
+                            //         auditLog(event.creater_email_id.trim(), 'Created Audit Step', function(value) {
+                            //             callback(null, { status: 'Success', Status_Message: 'Audit Step Added Successfully!!' });
+                            //         });
+                            //     });
+                            // }
+                            let promise_array = [];
+                            if (form_check) {
+                                promise_array.push(
+                                    new Promise(function(resolve, reject) {
+                                        let checkIfFormExists = {
+                                            TableName: 'XcelAudit_AuditForms',
+                                            KeyConditionExpression: '#form_id = :form_id',
+                                            FilterExpression: 'form_configured = :form_configured',
+                                            ExpressionAttributeNames: {
+                                                '#form_id': 'form_id',
+                                            },
+                                            ExpressionAttributeValues: {
+                                                ':form_id': event.form_id,
+                                                ':form_configured': true
+                                            },
+                                        };
+                                        queryDynamo(checkIfFormExists, callback, function(form) {
+                                            if (form.Count > 0) {
+                                                resolve(form.Items[0]);
+                                            }
+                                            else {
+                                                reject("This Form Is Not Configured");
+                                            }
+                                        });
+                                    })
+                                );
+                            }
+                            if (checklist_check) {
+                                promise_array.push(
+                                    new Promise(function(resolve, reject) {
+                                        let checkIfCheckListExists = {
+                                            TableName: 'XcelAudit_AuditCheckList',
+                                            KeyConditionExpression: '#check_list_id  = :check_list_id',
+                                            FilterExpression: 'check_list_configured = :check_list_configured',
+                                            ExpressionAttributeNames: {
+                                                '#check_list_id': 'check_list_id',
+                                            },
+                                            ExpressionAttributeValues: {
+                                                ':check_list_id': event.check_list_id,
+                                                ':form_configured': true
+                                            },
+                                        };
+                                        queryDynamo(checkIfCheckListExists, callback, function(checkList) {
+                                            if (checkList.Count > 0) {
+                                                resolve(checkList.Items[0]);
+                                            }
+                                            else {
+                                                reject("This CheckList Is Not Configured");
+                                            }
+                                        });
+                                    })
+                                );
+                            }
+                            Promise.all(promise_array).then((value) => {
+                                insertIntoDynamo(newAuditStepsParams, callback, function(InsertedData) {
+                                    auditLog(event.creater_email_id.trim(), 'Created Audit Step', function(value) {
+                                        callback(null, { status: 'Success', Status_Message: 'Audit Step Added Successfully!!' });
+                                    });
+                                });
+                            });
+                        }
+                        else {
+                            callback(new Error('Sub Category With ID : ' + event.selected_sub_category_id + " doesn't Exist"));
+                        }
+                    }
+                    else {
+                        callback(new Error('Category with Id: ' + event.category_id + ' not Found!!'));
+                    }
+                });
+            }
+            else {
+                callback(new Error('Audit Step  with Name : ' + event.step_name + ' Already Exist'));
+            }
+        });
+    }
+    else {
+        callback(new Error('Empty Field Incurred cannot create audit step'));
+    }
+}
+
+function createBulkAuditSteps(event, context, callback) {
+    let checkEmptyFields = true;
+    for (const field in event) {
+        if (typeof event[field] == "string") {
+            if (event[field].trim().length == 0) {
+                checkEmptyFields = false;
+            }
+        }
+    }
+    if (checkEmptyFields) {
+        let checkIfCategoryExists = {
+            TableName: "XcelAudit_Categories",
+            KeyConditionExpression: "#category_id = :category_id",
+            ExpressionAttributeNames: { "#category_id": "category_id" },
+            ExpressionAttributeValues: { ":category_id": event.steps_array[0].selected_category_id },
+        };
+        queryDynamo(checkIfCategoryExists, callback, function(category) {
+            if (category.Count > 0) {
+                let subcategoryExists = false;
+                let subCategoryName = "";
+                for (let subcategory in category.Items[0].sub_categories) {
+                    let single_sub_category = category.Items[0].sub_categories[subcategory];
+                    for (let single_element in single_sub_category) {
+                        if (single_element == "sub_category_id" && single_sub_category[single_element] == event.steps_array[0].selected_sub_category_id) {
+                            subcategoryExists = true;
+                            subCategoryName = single_sub_category["sub_category_name"];
+                            break;
+                        }
+                    }
+                    if (subcategoryExists) {
+                        break;
+                    }
+                }
+                if (subcategoryExists) {
+                    let master_promise_array = [];
+                    let rejected_steps = [];
+
+                    for (let i = 0; i < event.steps_array.length; i++) {
+                        master_promise_array.push(
+                            new Promise((res, rej) => {
+                                let checkIfAuditStepExists = {
+                                    TableName: "XcelAudit_AuditSteps",
+                                    IndexName: "step_name-index",
+                                    KeyConditionExpression: "#step_name = :step_name and #creater_email_id = :creater_email_id ",
+                                    ExpressionAttributeNames: {
+                                        "#step_name": "step_name",
+                                        "#creater_email_id": "creater_email_id",
+                                    },
+                                    ExpressionAttributeValues: {
+                                        ":step_name": event.steps_array[i].step_name,
+                                        ":creater_email_id": event.creater_email_id,
+                                    }
+                                };
+                                queryDynamo(checkIfAuditStepExists, callback, function(auditStep) {
+                                    if (auditStep.Count == 0) {
+                                        let checkIfAuditIdParams = {
+                                            TableName: "XcelAudit_AuditSteps",
+                                            IndexName: 'audit_id-index',
+                                            KeyConditionExpression: "#audit_id = :audit_id",
+                                            ExpressionAttributeNames: { "#audit_id": "audit_id" },
+                                            ExpressionAttributeValues: { ":audit_id": event.steps_array[i].audit_id },
+                                        };
+                                        queryDynamo(checkIfAuditIdParams, callback, function(audit_id) {
+                                            if (audit_id.Count == 0) {
+                                                let form_check = false;
+                                                let checklist_check = false;
+                                                let newAuditStepsParams = {
+                                                    Item: {
+                                                        step_id: uuid.v4(),
+                                                        audit_id: event.steps_array[i].audit_id,
+                                                        step_name: event.steps_array[i].step_name,
+                                                        step_description: event.steps_array[i].step_description,
+                                                        step_status: "ACTIVE",
+                                                        selected_category_id: event.steps_array[i].selected_category_id,
+                                                        selected_category_name: category.Items[0].category_name,
+                                                        selected_sub_category_id: event.steps_array[i].selected_sub_category_id,
+                                                        selected_sub_category_name: subCategoryName,
+                                                        work_load_weightage: event.steps_array[i].work_load_weightage,
+                                                        work_docs_type: event.steps_array[i].work_docs_type,
+                                                        conditionally_applicable: event.steps_array[i].conditionally_applicable,
+                                                        conditionally_applicable_value: event.steps_array[i].conditionally_applicable_value,
+                                                        creater_email_id: event.creater_email_id,
+                                                        ep_review: event.steps_array[i].ep_review,
+                                                        qcp_review: event.steps_array[i].qcp_review,
+                                                    },
+                                                    TableName: "XcelAudit_AuditSteps",
+                                                    ConditionExpression: "attribute_not_exists(step_id)",
+                                                    ReturnValues: "ALL_OLD",
+                                                };
+                                                if (event.steps_array[i].form_id != undefined) {
+                                                    form_check = true;
+                                                    newAuditStepsParams.Item.form_id = event.steps_array[i].form_id;
+                                                    newAuditStepsParams.Item.form_name = event.steps_array[i].form_name;
+                                                    newAuditStepsParams.Item.form_rule_configured = false;
+                                                    newAuditStepsParams.Item.form_configured = true;
+                                                    newAuditStepsParams.Item.s3_key = "xcel-audit-documents/AuditForms/" + event.steps_array[i].form_id;
+                                                }
+
+                                                if (event.steps_array[i].check_list_id != undefined) {
+                                                    newAuditStepsParams.Item.check_list_id = event.steps_array[i].check_list_id;
+                                                    newAuditStepsParams.Item.check_list_name = event.steps_array[i].check_list_name;
+                                                    newAuditStepsParams.Item.check_list__rule_configured = false;
+                                                    newAuditStepsParams.Item.check_list_configured = true;
+                                                    newAuditStepsParams.Item.s3_key = "xcel-audit-documents/Checklists/" + event.steps_array[i].check_list_id;
+                                                }
+
+                                                if (event.steps_array[i].excel_template != undefined) {
+                                                    newAuditStepsParams.Item.excel_template = event.steps_array[i].excel_template;
+                                                }
+                                                if (event.excel_template_url != undefined) {
+                                                    newAuditStepsParams.Item.excel_template_url = event.steps_array[i].excel_template_url;
+                                                }
+                                                let promise_array = [];
+                                                if (form_check) {
+                                                    promise_array.push(
+                                                        new Promise(function(resolve, reject) {
+                                                            let checkIfFormExists = {
+                                                                TableName: "XcelAudit_AuditForms",
+                                                                KeyConditionExpression: "#form_id = :form_id",
+                                                                FilterExpression: "form_configured = :form_configured",
+                                                                ExpressionAttributeNames: {
+                                                                    "#form_id": "form_id",
+                                                                },
+                                                                ExpressionAttributeValues: {
+                                                                    ":form_id": event.steps_array[i].form_id,
+                                                                    ":form_configured": true,
+                                                                },
+                                                            };
+                                                            queryDynamo(checkIfFormExists, callback, function(form) {
+                                                                if (form.Count > 0) {
+                                                                    resolve(form.Items[0]);
+                                                                }
+                                                                else {
+                                                                    rejected_steps.push({
+                                                                        ...event.steps_array[i],
+                                                                        rejection_reason: "This Form Is Not Configured"
+                                                                    });
+                                                                    reject("This Form Is Not Configured");
+                                                                }
+                                                            });
+                                                        })
+                                                    );
+                                                }
+                                                if (checklist_check) {
+                                                    promise_array.push(
+                                                        new Promise(function(resolve, reject) {
+                                                            let checkIfCheckListExists = {
+                                                                TableName: "XcelAudit_AuditCheckList",
+                                                                KeyConditionExpression: "#check_list_id  = :check_list_id",
+                                                                FilterExpression: "check_list_configured = :check_list_configured",
+                                                                ExpressionAttributeNames: {
+                                                                    "#check_list_id": "check_list_id",
+                                                                },
+                                                                ExpressionAttributeValues: {
+                                                                    ":check_list_id": event.steps_array[i].check_list_id,
+                                                                    ":form_configured": true,
+                                                                },
+                                                            };
+                                                            queryDynamo(checkIfCheckListExists, callback, function(checkList) {
+                                                                if (checkList.Count > 0) {
+                                                                    resolve(checkList.Items[0]);
+                                                                }
+                                                                else {
+                                                                    rejected_steps.push({
+                                                                        ...event.steps_array[i],
+                                                                        rejection_reason: "This CheckList Is Not Configured"
+                                                                    });
+                                                                    reject("This CheckList Is Not Configured");
+                                                                }
+                                                            });
+                                                        })
+                                                    );
+                                                }
+                                                Promise.all(promise_array).then((value) => {
+                                                    insertIntoDynamo(newAuditStepsParams, callback, function(InsertedData) {
+                                                        auditLog(event.creater_email_id.trim(), "Created Audit Step", function(value) {
+                                                            res({ status: "Success", Status_Message: "Audit Steps Added Successfully!!" });
+                                                        });
+                                                    });
+                                                }).catch(err => {
+                                                    console.log(err);
+                                                    res({ status: "Success", Status_Message: "Audit Steps Added Successfully!!" });
+                                                });
+                                            }
+                                            else {
+                                                res(true);
+                                                rejected_steps.push({
+                                                    ...event.steps_array[i],
+                                                    rejection_reason: "Audit ID Already Exists"
+                                                });
+                                            }
+                                        });
+                                    }
+                                    else {
+                                        res(true);
+                                        rejected_steps.push({
+                                            ...event.steps_array[i],
+                                            rejection_reason: "Step Name Already Exists"
+                                        });
+                                    }
+                                });
+                            })
+                        );
+                    }
+                    Promise.all(master_promise_array).then((data) => {
+                        if (rejected_steps.length == 0) {
+                            callback(null, { status: "Success", Status_Message: "Audit Step Added Successfully!!" });
+                        }
+                        else {
+                            callback(null, { status: "Failure", rejected_steps });
+                        }
+                    });
+                }
+                else {
+                    callback(new Error("Sub Category Not Found"));
+                }
+            }
+            else {
+                callback(new Error("Category Not Found"));
+            }
+        });
+    }
+    else {
+        callback(new Error("Empty Field Incurred cannot create audit step"));
+    }
+}
+
+function listAuditSteps(event, context, callback) {
+    let getAuditSteps = {
+        TableName: 'XcelAudit_AuditSteps',
+        ScanIndexForward: false,
+        Limit: 100,
+    };
+    if (event.next_token != null && event.next_token != undefined) {
+        getAuditSteps.ExclusiveStartKey = JSON.parse(Buffer.from(event.next_token, 'base64').toString('ascii'));
+    }
+    scanDynamo(getAuditSteps, callback, function(data) {
+        if (data.Count > 0) {
+            let response = {};
+            response.items = data.Items;
+            if (data.LastEvaluatedKey != undefined && data.LastEvaluatedKey != null) {
+                response.next_token = Buffer.from(JSON.stringify(data.LastEvaluatedKey)).toString('base64');
+            }
+            callback(null, {
+                status: 'SUCCESS',
+                data: response,
+            });
+        }
+        else {
+            callback(new Error('No Audit Steps Found'));
+        }
+    });
+}
+
+function updateAuditStep(event, context, callback) {
+    if (event.step_id.trim().length != 0) {
+        let checkIfAuditStepExists = {
+            TableName: 'XcelAudit_AuditSteps',
+            KeyConditionExpression: '#step_id = :step_id',
+            ExpressionAttributeNames: { '#step_id': 'step_id' },
+            ExpressionAttributeValues: { ':step_id': event.step_id },
+        };
+        queryDynamo(checkIfAuditStepExists, callback, function(organisation) {
+            if (organisation.Count > 0) {
+                let UpdateExpression = 'set';
+                let ExpressionAttributeNames = {};
+                let ExpressionAttributeValues = {};
+                for (const field in event) {
+                    if (field == 'step_id' || field == 'command' || field == 'creater_email_id' || field == 'audit_id') {
+                        continue;
+                    }
+                    else {
+                        if (event[field].trim().length != 0) {
+                            UpdateExpression += ` #${field} = :${field} ,`;
+                            ExpressionAttributeNames['#' + field] = field;
+                            ExpressionAttributeValues[':' + field] = event[field];
+                        }
+                        else {
+                            callback(new Error(field + ' cannot be updated to empty value'));
+                        }
+                    }
+                }
+                if (UpdateExpression != 'set') {
+                    UpdateExpression = UpdateExpression.slice(0, -1);
+                    let updateLocationParams = {
+                        TableName: 'XcelAudit_AuditSteps',
+                        Key: {
+                            step_id: event.step_id,
+                        },
+                        UpdateExpression: UpdateExpression,
+                        ExpressionAttributeNames: ExpressionAttributeNames,
+                        ExpressionAttributeValues: ExpressionAttributeValues,
+                        ReturnValues: 'UPDATED_NEW',
+                    };
+                    updateDynamoRecord(updateLocationParams, callback, function(data) {
+                        auditLog(event.creater_email_id.trim(), 'Updated Audit Step', function(value) {
+                            callback(null, { status: 'Success', Status_Message: ' updated audit step Successfully!!' });
+                        });
+                    });
+                }
+                else {
+                    callback(new Error('Audit Step Cannot be updated !!!'));
+                }
+            }
+            else {
+                callback(new Error('Audit Step Not Found !!!'));
+            }
+        });
+    }
+    else {
+        callback(new Error('Kindly, Enter step ID to update Audit Step'));
+    }
+}
+
+function createAuditForm(event, context, callback) {
+    let checkEmptyFields = true;
+    for (const field in event) {
+        if (typeof event[field] == 'string') {
+            if (event[field].trim().length == 0) {
+                checkEmptyFields = false;
+            }
+        }
+    }
+    if (checkEmptyFields) {
+        let checkIfFormExists = {
+            TableName: 'XcelAudit_AuditForms',
+            IndexName: 'form_name-index',
+            KeyConditionExpression: '#form_name = :form_name',
+            ExpressionAttributeNames: {
+                '#form_name': 'form_name',
+            },
+            ExpressionAttributeValues: {
+                ':form_name': event.form_name,
+            },
+        };
+        queryDynamo(checkIfFormExists, callback, function(form) {
+            if (form.Count == 0) {
+                let newFormParams = {
+                    Item: {
+                        form_id: uuid.v4(),
+                        form_name: event.form_name,
+                        form_description: event.form_description,
+                        form_configured: false,
+                        form_country: event.form_country,
+                        created_on: Date.now(),
+                    },
+                    TableName: 'XcelAudit_AuditForms',
+                    ConditionExpression: 'attribute_not_exists(form_id)',
+                    ReturnValues: 'ALL_OLD',
+                };
+                insertIntoDynamo(newFormParams, callback, function(InsertedData) {
+                    //auditLog(event.creater_email_id.trim(), "Created Audit Form"+event.form_name, function (value) {
+                    callback(null, { status: 'Success', Status_Message: 'Form Added Successfully!!' });
+                    //});
+                });
+            }
+            else {
+                callback(new Error('Form Exists with the given form name: ' + event.form_name));
+            }
+        });
+    }
+    else {
+        callback(new Error("Empty Field Incurred!! Can't Create Audit Form"));
+    }
+}
+
+function listAuditForms(event, context, callback) {
+    let getForms = {
+        TableName: 'XcelAudit_AuditForms',
+        ScanIndexForward: false,
+        Limit: 100,
+    };
+    if (event.next_token != null && event.next_token != undefined) {
+        getForms.ExclusiveStartKey = JSON.parse(Buffer.from(event.next_token, 'base64').toString('ascii'));
+    }
+    scanDynamo(getForms, callback, function(data) {
+        if (data.Count > 0) {
+            let response = {};
+            response.items = data.Items;
+            let forms = data.Items;
+            let formsToShow = [];
+            // for (let key = 0; key < forms.length; key++) {
+            //     let elementToInsert = forms[key];
+            //     for (let item = 0; item < forms.length; item++) {
+            //         if (forms[item].form_name == forms[key].form_name) {
+            //             if (forms[item].form_version > forms[key].form_version) {
+            //                 elementToInsert = forms[item];
+            //             }
+            //         }
+            //     }
+            //     formsToShow.push(elementToInsert);
+            // }
+            //formsToShow = [...new Set(formsToShow)];
+
+            for (let i = 0; i < forms.length - 1; i++) {
+                for (let j = 0; j < forms.length - 1 - i; j++) {
+                    if (forms[j].created_on > forms[j + 1].created_on) {
+                        let temp = forms[j];
+                        forms[j] = forms[j + 1];
+                        forms[j + 1] = temp;
+                    }
+                }
+            }
+            response.items = forms;
+            if (data.LastEvaluatedKey != undefined && data.LastEvaluatedKey != null) {
+                response.next_token = Buffer.from(JSON.stringify(data.LastEvaluatedKey)).toString('base64');
+            }
+            callback(null, {
+                status: 'SUCCESS',
+                data: response,
+            });
+        }
+        else {
+            callback(new Error('Currently there are No Forms Created'));
+        }
+    });
+}
+
+function updateAuditForm(event, context, callback) {
+    if (event.form_id.trim().length != 0) {
+        let checkIfAuditFormExists = {
+            TableName: 'XcelAudit_AuditForms',
+            KeyConditionExpression: '#form_id = :form_id',
+            ExpressionAttributeNames: { '#form_id': 'form_id' },
+            ExpressionAttributeValues: { ':form_id': event.form_id },
+        };
+        queryDynamo(checkIfAuditFormExists, callback, function(Form) {
+            if (Form.Count > 0) {
+                let checkFormNameAndUpdate = false;
+                let UpdateExpression = 'set';
+                let ExpressionAttributeNames = {};
+                let ExpressionAttributeValues = {};
+                for (const field in event) {
+                    if (field == 'form_description') {
+                        if (event[field].trim().length != 0) {
+                            UpdateExpression += ` #${field} = :${field} ,`;
+                            ExpressionAttributeNames['#' + field] = field;
+                            ExpressionAttributeValues[':' + field] = event[field];
+                        }
+                        else {
+                            callback(new Error(field + ' cannot be updated to empty value'));
+                        }
+                    }
+                    else if (field == 'form_name') {
+                        checkFormNameAndUpdate = true;
+                    }
+                }
+                if (checkFormNameAndUpdate) {
+                    let checkIfFormExists = {
+                        TableName: 'XcelAudit_AuditForms',
+                        IndexName: 'form_name-index',
+                        KeyConditionExpression: '#form_name = :form_name',
+                        ExpressionAttributeNames: {
+                            '#form_name': 'form_name',
+                        },
+                        ExpressionAttributeValues: {
+                            ':form_name': event.form_name,
+                        },
+                    };
+                    queryDynamo(checkIfFormExists, callback, function(form) {
+                        if (form.Count == 0) {
+                            if (event['form_name'].trim().length != 0) {
+                                UpdateExpression += ` #form_name" = ":form_name,`;
+                                ExpressionAttributeNames['#form_name'] = 'form_name';
+                                ExpressionAttributeValues[':form_name'] = event['form_name'];
+                                if (UpdateExpression != 'set') {
+                                    UpdateExpression = UpdateExpression.slice(0, -1);
+                                    let updateAuditFormParams = {
+                                        TableName: 'XcelAudit_AuditForms',
+                                        Key: {
+                                            form_id: event.form_id,
+                                        },
+                                        UpdateExpression: UpdateExpression,
+                                        ExpressionAttributeNames: ExpressionAttributeNames,
+                                        ExpressionAttributeValues: ExpressionAttributeValues,
+                                        ReturnValues: 'UPDATED_NEW',
+                                    };
+                                    updateDynamoRecord(updateAuditFormParams, callback, function(data) {
+                                        auditLog(event.creater_email_id.trim(), 'Updated Audit Forms', function(value) {
+                                            callback(null, { status: 'Success', Status_Message: ' updated audit form Successfully!!' });
+                                        });
+                                    });
+                                }
+                                else {
+                                    callback(new Error('Audit Form Cannot be updated !!!'));
+                                }
+                            }
+                            else {
+                                callback(new Error('Form Name Cannot Be Updated To Empty Value'));
+                            }
+                        }
+                        else {
+                            callback(new Error('Form Name Cannot be updated as the new form name is already in use!!'));
+                        }
+                    });
+                }
+                else {
+                    if (UpdateExpression != 'set') {
+                        UpdateExpression = UpdateExpression.slice(0, -1);
+                        let updateAuditFormParams = {
+                            TableName: 'XcelAudit_AuditForms',
+                            Key: {
+                                form_id: event.form_id,
+                            },
+                            UpdateExpression: UpdateExpression,
+                            ExpressionAttributeNames: ExpressionAttributeNames,
+                            ExpressionAttributeValues: ExpressionAttributeValues,
+                            ReturnValues: 'UPDATED_NEW',
+                        };
+                        updateDynamoRecord(updateAuditFormParams, callback, function(data) {
+                            auditLog(event.creater_email_id.trim(), 'Updated Audit Forms', function(value) {
+                                callback(null, { status: 'Success', Status_Message: ' updated audit form Successfully!!' });
+                            });
+                        });
+                    }
+                    else {
+                        callback(new Error('Audit Form Cannot be updated !!!'));
+                    }
+                }
+            }
+            else {
+                callback(new Error('Audit Form with Form_id : ' + event.form_id + ' not found!'));
+            }
+        });
+    }
+    else {
+        callback(new Error('Kindly Enter Audit Form Id to Publish Audit Form'));
+    }
+}
+
+function listAuditLogs(event, context, callback) {
+    let getAuditLogs = {
+        TableName: 'XcelAudit_BMS_Logs',
+        ScanIndexForward: false,
+        Limit: 100,
+    };
+    if (event.next_token != null && event.next_token != undefined) {
+        getAuditLogs.ExclusiveStartKey = JSON.parse(Buffer.from(event.next_token, 'base64').toString('ascii'));
+    }
+    scanDynamo(getAuditLogs, callback, function(data) {
+        if (data.Count > 0) {
+            let response = {};
+            response.items = data.Items;
+            if (data.LastEvaluatedKey != undefined && data.LastEvaluatedKey != null) {
+                response.next_token = Buffer.from(JSON.stringify(data.LastEvaluatedKey)).toString('base64');
+            }
+            callback(null, {
+                status: 'SUCCESS',
+                data: response,
+            });
+        }
+        else {
+            callback(new Error('No Audit Logs Found'));
+        }
+    });
+}
+
+function configureForm(event, context, callback) {
+    let checkEmptyFields = true;
+    for (const field in event) {
+        if (typeof event[field] == 'string') {
+            if (event[field].trim().length == 0) {
+                checkEmptyFields = false;
+            }
+        }
+    }
+    if (checkEmptyFields) {
+        let getFormParams = {
+            TableName: 'XcelAudit_AuditForms',
+            KeyConditionExpression: '#form_id = :form_id',
+            ExpressionAttributeNames: { '#form_id': 'form_id' },
+            ExpressionAttributeValues: { ':form_id': event.form_id },
+        };
+        queryDynamo(getFormParams, callback, function(form) {
+            if (form.Count > 0) {
+                let updateFormParams = {
+                    TableName: 'XcelAudit_AuditForms',
+                    Key: {
+                        form_id: event.form_id,
+                    },
+                    UpdateExpression: 'set s3_url = :s3_url, s3_version_id = :s3_version_id,form_configured = :form_configured',
+                    ExpressionAttributeValues: {
+                        ':s3_url': event.s3_url,
+                        ':s3_version_id': event.s3_version_id,
+                        ':form_configured': true,
+                    },
+                    ReturnValues: 'UPDATED_NEW',
+                };
+                updateDynamoRecord(updateFormParams, callback, function(data) {
+                    callback(null, { status: 'Success', Status_Message: ' Form Saved successfully!!' });
+                });
+            }
+            else {
+                callback(new Error('Form with ID: ' + event.form_id + ' not found'));
+            }
+        });
+    }
+    else {
+        callback(new Error('Empty Fields Occured cannot save form'));
+    }
+}
+
+function configureAuditStepField(event, context, callback) {
+    let checkEmptyFields = true;
+    for (const field in event) {
+        if (typeof event[field] == 'string') {
+            if (event[field].trim().length == 0) {
+                checkEmptyFields = false;
+            }
+        }
+    }
+    if (checkEmptyFields) {
+        let getStepDetailsParams = {
+            TableName: 'XcelAudit_AuditSteps',
+            KeyConditionExpression: '#step_id = :step_id',
+            ExpressionAttributeNames: { '#step_id': 'step_id' },
+            ExpressionAttributeValues: { ':step_id': event.step_id },
+        };
+        queryDynamo(getStepDetailsParams, callback, function(step) {
+            if (step.Count > 0) {
+                let rule_array = [];
+                for (let j = 0; j < event.form_rule.length; j++) {
+                    let rule = {
+                        dependent_step_id: event.form_rule[j].dependent_step_id,
+                        dependent_field_id: event.form_rule[j].dependent_field_id,
+                        condition: event.form_rule[j].condition,
+                        condition_value: event.form_rule[j].condition_value,
+                        condition_step_id: event.form_rule[j].condition_step_id,
+                        condition_field_id: event.form_rule[j].condition_field_id,
+                        condition_field_name: event.form_rule[j].condition_field_name,
+                        applicablity: event.form_rule[j].applicablity,
+                        field_type: event.form_rule[j].field_type,
+                        configuration_logic: event.form_rule[j].configuration_logic,
+                        dependent_step_name: event.form_rule[j].dependent_step_name,
+                        rule_type: event.form_rule[j].rule_type,
+                    };
+                    rule_array.push(rule);
+                    step.Items[0][event.form_rule[0].dependent_field_id].rule = rule_array;
+                }
+                if (event.form_rule.length > 0) {
+                    step.Items[0][event.form_rule[0].dependent_field_id].has_rule = true;
+                    let updateAuditStepParams = {
+                        TableName: 'XcelAudit_AuditSteps',
+                        Key: {
+                            step_id: event.step_id,
+                        },
+                        UpdateExpression: 'set ',
+                        ExpressionAttributeValues: {},
+                        ExpressionAttributeNames: {},
+                        ReturnValues: 'UPDATED_NEW',
+                    };
+                    updateAuditStepParams.UpdateExpression = updateAuditStepParams.UpdateExpression + '#step_field = :step_field';
+                    updateAuditStepParams.ExpressionAttributeNames['#step_field'] = event.form_rule[0].dependent_field_id;
+                    updateAuditStepParams.ExpressionAttributeValues[':step_field'] = step.Items[0][event.form_rule[0].dependent_field_id];
+                    updateDynamoRecord(updateAuditStepParams, callback, function(data) {
+                        callback(null, { status: 'Success', Status_Message: ' Configured step successfully!!' });
+                    });
+                }
+                else {
+                    step.Items[0][event.field_id].has_rule = false;
+                    step.Items[0][event.field_id].rule = [];
+                    let updateAuditStepParams = {
+                        TableName: 'XcelAudit_AuditSteps',
+                        Key: {
+                            step_id: event.step_id,
+                        },
+                        UpdateExpression: 'set ',
+                        ExpressionAttributeValues: {},
+                        ExpressionAttributeNames: {},
+                        ReturnValues: 'UPDATED_NEW',
+                    };
+                    updateAuditStepParams.UpdateExpression = updateAuditStepParams.UpdateExpression + '#step_field = :step_field';
+                    updateAuditStepParams.ExpressionAttributeNames['#step_field'] = event.field_id;
+                    updateAuditStepParams.ExpressionAttributeValues[':step_field'] = step.Items[0][event.field_id];
+                    updateDynamoRecord(updateAuditStepParams, callback, function(data) {
+                        callback(null, { status: 'Success', Status_Message: ' Configured step successfully!!' });
+                    });
+                }
+            }
+            else {
+                callback(new Error('Step with ID: ' + event.step_id + ' not found'));
+            }
+        });
+    }
+    else {
+        callback(new Error('Empty Fields occured cannot configure audit step'));
+    }
+}
+
+function listAuditStepDetails(event, context, callback) {
+    if (event.step_id.trim().length > 0) {
+        let getStepDetailsParams = {
+            TableName: 'XcelAudit_AuditSteps',
+            KeyConditionExpression: '#step_id = :step_id',
+            ExpressionAttributeNames: { '#step_id': 'step_id' },
+            ExpressionAttributeValues: { ':step_id': event.step_id },
+        };
+        queryDynamo(getStepDetailsParams, callback, function(step) {
+            if (step.Count > 0) {
+                let response = {};
+                response.items = step.Items;
+                if (step.LastEvaluatedKey != undefined && step.LastEvaluatedKey != null) {
+                    response.next_token = Buffer.from(JSON.stringify(step.LastEvaluatedKey)).toString('base64');
+                }
+                callback(null, {
+                    status: 'SUCCESS',
+                    data: response,
+                });
+            }
+            else {
+                callback(new Error('Audit Step with ID: ' + event.step_id + ' not found'));
+            }
+        });
+    }
+    else {
+        callback(new Error('Empty Fields occured cannot configure audit step'));
+    }
+}
+
+function listAuditStepRules(event, context, callback) {
+    let checkEmptyFields = true;
+    for (const field in event) {
+        if (typeof event[field] == 'string') {
+            if (event[field].trim().length == 0) {
+                checkEmptyFields = false;
+            }
+        }
+    }
+    if (checkEmptyFields) {
+        let getStepDetailsParams = {
+            TableName: 'XcelAudit_AuditSteps',
+            KeyConditionExpression: '#step_id = :step_id',
+            ProjectExpression: event.field_id,
+            ExpressionAttributeNames: { '#step_id': 'step_id' },
+            ExpressionAttributeValues: { ':step_id': event.step_id },
+        };
+        queryDynamo(getStepDetailsParams, callback, function(step) {
+            let data = step.Items[0][event.field_id];
+            if (step.Count > 0) {
+                let response = {};
+                response.items = data;
+                callback(null, {
+                    status: 'SUCCESS',
+                    data: response,
+                });
+            }
+            else {
+                callback(new Error('Cannot find step with field id: ' + event.field_id));
+            }
+        });
+    }
+    else {
+        callback(new Error('Empty Fields occured cannot list rules audit step'));
+    }
+}
+
+function createAuditCheckList(event, context, callback) {
+    let checkEmptyFields = true;
+    for (const field in event) {
+        if (typeof event[field] == 'string') {
+            if (event[field].trim().length == 0) {
+                checkEmptyFields = false;
+            }
+        }
+    }
+    if (checkEmptyFields) {
+        let checkIfCheckListExists = {
+            TableName: 'XcelAudit_AuditCheckList',
+            IndexName: 'check_list_name-check_list_country-index',
+            KeyConditionExpression: '#check_list_name = :check_list_name AND check_list_country = :check_list_country',
+            ExpressionAttributeNames: {
+                '#check_list_name': 'check_list_name',
+            },
+            ExpressionAttributeValues: {
+                ':check_list_name': event.check_list_name,
+                ':check_list_country': event.check_list_country
+            },
+        };
+        queryDynamo(checkIfCheckListExists, callback, function(checklist) {
+            if (checklist.Count == 0) {
+                let newCheckListParams = {
+                    Item: {
+                        check_list_id: uuid.v4(),
+                        check_list_name: event.check_list_name,
+                        check_list_description: event.check_list_description,
+                        check_list_configured: false,
+                        check_list_country: event.check_list_country,
+                        created_on: new Date().getTime(),
+                    },
+                    TableName: 'XcelAudit_AuditCheckList',
+                    ConditionExpression: 'attribute_not_exists(form_id)',
+                    ReturnValues: 'ALL_OLD',
+                };
+                insertIntoDynamo(newCheckListParams, callback, function(InsertedData) {
+                    //auditLog(event.creater_email_id.trim(), "Created Audit Form"+event.form_name, function (value) {
+                    callback(null, { status: 'Success', Status_Message: 'CheckList Added Successfully!!' });
+                    //});
+                });
+            }
+            else {
+                callback(new Error('CheckList Exists with the given List name: ' + event.check_list_name));
+            }
+        });
+    }
+    else {
+        callback(new Error("Empty Field Incurred!! Can't Create Audit CheckList"));
+    }
+}
+
+function listAuditCheckLists(event, context, callback) {
+    let getForms = {
+        TableName: 'XcelAudit_AuditCheckList',
+        ScanIndexForward: false,
+        Limit: 100,
+    };
+    if (event.next_token != null && event.next_token != undefined) {
+        getForms.ExclusiveStartKey = JSON.parse(Buffer.from(event.next_token, 'base64').toString('ascii'));
+    }
+    scanDynamo(getForms, callback, function(data) {
+        if (data.Count > 0) {
+            let response = {};
+            data.Items.sort((a, b) => {
+                return b.created_on - a.created_on;
+            });
+            response.items = data.Items;
+            if (data.LastEvaluatedKey != undefined && data.LastEvaluatedKey != null) {
+                response.next_token = Buffer.from(JSON.stringify(data.LastEvaluatedKey)).toString('base64');
+            }
+            callback(null, {
+                status: 'SUCCESS',
+                data: response,
+            });
+        }
+        else {
+            callback(new Error('Currently there are No CheckLists Created'));
+        }
+    });
+}
+
+function configureCheckList(event, context, callback) {
+    let checkEmptyFields = true;
+    for (const field in event) {
+        if (typeof event[field] == 'string') {
+            if (event[field].trim().length == 0) {
+                checkEmptyFields = false;
+            }
+        }
+    }
+    if (checkEmptyFields) {
+        let getFormParams = {
+            TableName: 'XcelAudit_AuditCheckList',
+            KeyConditionExpression: '#check_list_id = :check_list_id',
+            ExpressionAttributeNames: { '#check_list_id': 'check_list_id' },
+            ExpressionAttributeValues: { ':check_list_id': event.check_list_id },
+        };
+        queryDynamo(getFormParams, callback, function(form) {
+            if (form.Count > 0) {
+                let updateFormParams = {
+                    TableName: 'XcelAudit_AuditCheckList',
+                    Key: {
+                        check_list_id: event.check_list_id,
+                    },
+                    UpdateExpression: 'set s3_url = :s3_url, s3_version_id = :s3_version_id,check_list_configured = :check_list_configured',
+                    ExpressionAttributeValues: {
+                        ':s3_url': event.s3_url,
+                        ':s3_version_id': event.s3_version_id,
+                        ':check_list_configured': true,
+                    },
+                    ReturnValues: 'UPDATED_NEW',
+                };
+                updateDynamoRecord(updateFormParams, callback, function(data) {
+                    callback(null, { status: 'Success', Status_Message: ' CheckList Saved successfully!!' });
+                });
+            }
+            else {
+                callback(new Error('CheckList with ID: ' + event.check_list_id + ' not found'));
+            }
+        });
+    }
+    else {
+        callback(new Error('Empty Fields Occured cannot save checkList'));
+    }
+}
+
+exports.handler = (event, context, callback) => {
+    console.log(event);
+    switch (event.command) {
+        case 'createUser':
+            createUser(event, context, callback);
+            break;
+        case 'listUsers':
+            listUsers(event, context, callback);
+            break;
+        case 'UpdateUser':
+            updateUser(event, context, callback);
+            break;
+        case 'createOrganisation':
+            createOrganisation(event, context, callback);
+            break;
+        case 'listOrganisations':
+            listOrganisations(event, context, callback);
+            break;
+        case 'updateOrganisation':
+            updateOrganisation(event, context, callback);
+            break;
+        case 'createAuditStep':
+            createAuditStep(event, context, callback);
+            break;
+        case 'listAuditStepDetails':
+            listAuditStepDetails(event, context, callback);
+            break;
+        case 'listAuditSteps':
+            listAuditSteps(event, context, callback);
+            break;
+        case 'configureAuditStep':
+            configureAuditStepField(event, context, callback);
+            break;
+        case 'updateAuditStep':
+            updateAuditStep(event, context, callback);
+            break;
+        case 'createAuditForm':
+            createAuditForm(event, context, callback);
+            break;
+        case 'configureForm':
+            configureForm(event, context, callback);
+            break;
+        case 'listAuditForms':
+            listAuditForms(event, context, callback);
+            break;
+        case 'updateAuditForm':
+            updateAuditForm(event, context, callback);
+            break;
+        case 'createCategory':
+            createCategory(event, context, callback);
+            break;
+        case 'listCategories':
+            listCategories(event, context, callback);
+            break;
+        case 'updateCategory':
+            updateCategory(event, context, callback);
+            break;
+        case 'deleteCategory':
+            deleteCategory(event, context, callback);
+            break;
+        case 'createSubCategory':
+            createSubCategory(event, context, callback);
+            break;
+        case 'updateSubCategory':
+            updateSubCategory(event, context, callback);
+            break;
+        case 'listSubCategories':
+            listSubCategories(event, context, callback);
+            break;
+        case 'deleteSubCategory':
+            deleteSubCategory(event, context, callback);
+            break;
+        case 'listAuditLogs':
+            listAuditLogs(event, context, callback);
+            break;
+        case 'listAuditStepRules':
+            listAuditStepRules(event, context, callback);
+            break;
+        case 'createAuditCheckList':
+            createAuditCheckList(event, context, callback);
+            break;
+        case 'listAuditCheckLists':
+            listAuditCheckLists(event, context, callback);
+            break;
+        case 'configureCheckList':
+            configureCheckList(event, context, callback);
+            break;
+        case 'createBulkAuditSteps':
+            createBulkAuditSteps(event, context, callback);
+            break;
+        default:
+            callback(new Error('Command not found'));
+    }
+};
