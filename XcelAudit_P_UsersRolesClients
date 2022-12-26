@@ -1,0 +1,1615 @@
+//USERS , ROLES , CLIENTS
+
+//XCELAUDIT USER PORTAL
+var AWS = require('aws-sdk');
+AWS.config.update({ region: 'ap-south-1' });
+var docClient = new AWS.DynamoDB.DocumentClient();
+var lambda = new AWS.Lambda();
+var cognitoidentityserviceprovider = new AWS.CognitoIdentityServiceProvider({ apiVersion: '2016-04-18' });
+var uuid = require('uuid');
+var constants = require('constants.json');
+
+function invoke_lambda(payload, function_name, callbackFunction) {
+	var params = {
+		FunctionName: function_name,
+		InvocationType: 'RequestResponse',
+		Payload: JSON.stringify(payload),
+	};
+	var response = lambda.invoke(params, function(err, data) {
+		if (err) {
+			console.log(err, 'inside invoke_lambda: could not invoke: error stack: ' + err.stack);
+		}
+		else {
+			if (typeof callbackFunction == 'function') callbackFunction(data);
+		}
+	});
+}
+
+function logErrorMsg(errMsg, params, stack, callback, callbackFn) {
+	var msg = 'Lambda function name :' + process.env.AWS_LAMBDA_FUNCTION_NAME + '\n\nError message : \n' + JSON.stringify(errMsg) + '\n\nParams : \n' + JSON.stringify(params) + '\n\nStack : \n' + JSON.stringify(stack) + '\n\n Cloudwatch stream :' + process.env.AWS_LAMBDA_LOG_STREAM_NAME;
+	invoke_lambda({ message: msg }, 'XcelAudit_B_P_ErrorLogs', function(data) {
+		callback(errMsg);
+	});
+}
+
+function auditLog(logger, message, organisation_id, client_id, project_id, callbackFunction) {
+	var params = {
+		FunctionName: 'XcelAudit_P_Logs',
+		InvocationType: 'RequestResponse',
+		Payload: JSON.stringify({ logger: logger, message: message, organisation_id: organisation_id, client_id: client_id, project_id: project_id }),
+	};
+	var response = lambda.invoke(params, function(err, data) {
+		if (err) {
+			console.log(err, 'inside invoke_lambda: could not invoke: error stack: ' + err.stack);
+		}
+		else {
+			if (typeof callbackFunction == 'function') callbackFunction(data);
+		}
+	});
+}
+
+function queryDynamo(params, callback, callbackFn) {
+	docClient.query(params, function(err, data) {
+		if (err) {
+			logErrorMsg(err, params, err.stack, callback, function(data) {
+				callback(err);
+			});
+		}
+		else {
+			if (typeof callbackFn === 'function') {
+				callbackFn(data);
+			}
+		}
+	});
+}
+
+function queryAllDynamo(event, callback, callbackFn) {
+	let swipes = { Count: 0, Items: [] };
+
+	function query_dynamo(event, callback, callbackFn) {
+		queryDynamo(event, callback, function(data) {
+			if (data.LastEvaluatedKey) {
+				swipes.Count += data.Count;
+				swipes.Items = swipes.Items.concat(data.Items);
+				event.ExclusiveStartKey = data.LastEvaluatedKey;
+				queryDynamo(event, callback, callbackFn);
+			}
+			else {
+				swipes.Count += data.Count;
+				swipes.Items = swipes.Items.concat(data.Items);
+				callbackFn(swipes);
+			}
+		});
+	}
+	query_dynamo(event, callback, callbackFn);
+}
+
+function insertIntoDynamo(params, callback, callbackFn) {
+	docClient.put(params, function(err, data) {
+		if (err) {
+			logErrorMsg(err, params, err.stack, callback, function(data) {
+				callback(err);
+			});
+		}
+		else {
+			if (typeof callbackFn === 'function') {
+				callbackFn(data);
+			}
+		}
+	});
+}
+
+function updateDynamoRecord(params, callback, callbackFn) {
+	docClient.update(params, function(err, data) {
+		if (err) {
+			logErrorMsg(err, params, err.stack, callback, function(data) {
+				callback(err);
+			});
+		}
+		else {
+			if (typeof callbackFn === 'function') {
+				callbackFn(data);
+			}
+		}
+	});
+}
+
+function deleteFromDynamo(params, callback, callbackFn) {
+	docClient.delete(params, function(err, data) {
+		if (err) {
+			logErrorMsg(err, params, err.stack, callback, function(data) {
+				callback(err);
+			});
+		}
+		else {
+			if (typeof callbackFn === 'function') {
+				callbackFn(data);
+			}
+		}
+	});
+}
+
+const wait = (ms) => new Promise((res) => setTimeout(res, ms));
+
+const batchDynamoOperation = (params, callback, callbackFn) => {
+	docClient.batchWrite(params, function(err, data) {
+		if (err) {
+			logErrorMsg(err, params, err.stack, callback, function(data) {
+				callback(err);
+			});
+		}
+		else {
+			if (typeof callbackFn === 'function') {
+				callbackFn(data);
+			}
+		}
+	});
+};
+
+function scanDynamo(params, callback, callbackFn) {
+	docClient.scan(params, function(err, data) {
+		if (err) {
+			logErrorMsg(err, params, err.stack, callback, function(data) {
+				callback(err);
+			});
+		}
+		else {
+			if (typeof callbackFn === 'function') {
+				callbackFn(data);
+			}
+		}
+	});
+}
+
+function createCognitoUser(email_id, poolId, callback, callbackFn) {
+	var params = {
+		UserPoolId: poolId,
+		Username: email_id.trim().toLowerCase(),
+		UserAttributes: [{
+				Name: 'email',
+				Value: email_id.trim().toLowerCase(),
+			},
+			{
+				Name: 'email_verified',
+				Value: 'true',
+			},
+		],
+		TemporaryPassword: (+Date.now()).toString(32),
+	};
+	cognitoidentityserviceprovider.adminCreateUser(params, function(err, data) {
+		if (!err) {
+			callbackFn(data);
+		}
+		else {
+			logErrorMsg(err, params, null, callback, function(data) {
+				callback(new Error('Unable to create Cognito Account with Email_ID : ' + email_id.toLowerCase()));
+			});
+		}
+	});
+}
+
+function forgotPassword(event, context, callback) {
+	var params = {
+		UserPoolId: constants.userPortalCognitoPool,
+		Username: event.email_id.trim().toLowerCase(),
+	};
+	cognitoidentityserviceprovider.forgotPassword(params, function(err, data) {
+		if (!err) {
+			callback(null, 'success');
+		}
+		else {
+			logErrorMsg(err, params, null, callback, function(data) {
+				callback(new Error('Unable to create Cognito Account with Email_ID : ' + event.email_id.toLowerCase()));
+			});
+		}
+	});
+}
+
+function listPortalLogs(event, context, callback) {
+	if (event.organisation_id.trim().length != 0) {
+		let getLogs = {
+			TableName: 'XcelAudit_UserPortal_Logs',
+			IndexName: 'organisation_id-index',
+			KeyConditionExpression: '#organisation_id = :organisation_id',
+			ExpressionAttributeNames: { '#organisation_id': 'organisation_id' },
+			ExpressionAttributeValues: { ':organisation_id': event.organisation_id },
+		};
+		if (event.next_token != null && event.next_token != undefined) {
+			getLogs.ExclusiveStartKey = JSON.parse(Buffer.from(event.next_token, 'base64').toString('ascii'));
+		}
+		queryDynamo(getLogs, callback, function(data) {
+			if (data.Count > 0) {
+				let response = {};
+				response.items = data.Items;
+				if (data.LastEvaluatedKey != undefined && data.LastEvaluatedKey != null) {
+					response.next_token = Buffer.from(JSON.stringify(data.LastEvaluatedKey)).toString('base64');
+				}
+				callback(null, {
+					status: 'SUCCESS',
+					data: response,
+				});
+			}
+			else {
+				callback(new Error('Currently there are no logs to view'));
+			}
+		});
+	}
+	else {
+		callback(new Error('Kindly,Enter Organisation ID to list the logs'));
+	}
+}
+
+function getCurrentUserDetails(event, context, callback) {
+	if (event.user_email_id.trim().length != 0) {
+		let getUserDetails = {
+			TableName: 'XcelAudit_UserPortal_Users',
+			IndexName: 'user_email_id-index',
+			KeyConditionExpression: '#user_email_id = :user_email_id',
+			ExpressionAttributeNames: { '#user_email_id': 'user_email_id' },
+			ExpressionAttributeValues: { ':user_email_id': event.user_email_id },
+		};
+		queryDynamo(getUserDetails, callback, function(data) {
+			if (data.Count > 0) {
+				let response = {};
+				let getOrganizationDetails = {
+					TableName: 'XcelAudit_Organisations',
+					KeyConditionExpression: '#organisation_id = :organisation_id',
+					FilterExpression: 'organisation_status = :organisation_status',
+					ExpressionAttributeNames: { '#organisation_id': 'organisation_id' },
+					ExpressionAttributeValues: {
+						':organisation_id': data.Items[0].organisation_id,
+						':organisation_status': 'ACTIVE',
+					},
+				};
+				queryDynamo(getOrganizationDetails, callback, function(organization) {
+					if (organization.Count > 0) {
+						data.Items[0].organisation_details = organization.Items[0];
+						response.items = data.Items;
+						if (data.LastEvaluatedKey != undefined && data.LastEvaluatedKey != null) {
+							response.next_token = Buffer.from(JSON.stringify(data.LastEvaluatedKey)).toString('base64');
+						}
+						callback(null, { status: 'SUCCESS', data: response });
+					}
+					else {
+						callback(new Error('Organization is DEACTIVATED'));
+					}
+				});
+			}
+			else {
+				callback(new Error('User With Email_ID ' + event.user_email_id + ' not Found!!'));
+			}
+		});
+	}
+	else {
+		callback(new Error('Kindly Enter User Email_ID to get user details'));
+	}
+}
+
+function createInternalUser(event, context, callback) {
+	let checkEmptyFields = true;
+	for (const field in event) {
+		if (typeof event[field] == 'string') {
+			if (event[field].trim().length == 0) {
+				checkEmptyFields = false;
+			}
+		}
+	}
+	if (checkEmptyFields) {
+		let checkIfOrganisationExists = {
+			TableName: 'XcelAudit_Organisations',
+			KeyConditionExpression: '#organisation_id = :organisation_id',
+			FilterExpression: 'organisation_status = :organisation_status',
+			ExpressionAttributeNames: { '#organisation_id': 'organisation_id' },
+			ExpressionAttributeValues: {
+				':organisation_id': event.organisation_id,
+				':organisation_status': 'ACTIVE',
+			},
+		};
+		queryDynamo(checkIfOrganisationExists, callback, function(organisation) {
+			if (organisation.Count > 0) {
+				let checkIfCreaterExists = {
+					TableName: 'XcelAudit_UserPortal_Users',
+					IndexName: 'user_email_id-index',
+					KeyConditionExpression: '#user_email_id = :user_email_id',
+					ExpressionAttributeNames: { '#user_email_id': 'user_email_id' },
+					ExpressionAttributeValues: { ':user_email_id': event.creater_email_id },
+				};
+				queryDynamo(checkIfCreaterExists, callback, function(creater) {
+					if (creater.Count > 0) {
+						if (event.users_array == undefined) {
+							event.users_array = [...event];
+						}
+						let promise_array = [];
+						let already_existing_users = [];
+						for (let i = 0; i < event.users_array.length; i++) {
+							promise_array.push(new Promise((res, rej) => {
+								let checkIfUserExists = {
+									TableName: 'XcelAudit_UserPortal_Users',
+									IndexName: 'user_email_id-index',
+									KeyConditionExpression: '#user_email_id = :user_email_id',
+									ExpressionAttributeNames: { '#user_email_id': 'user_email_id' },
+									ExpressionAttributeValues: { ':user_email_id': event.users_array[i].user_email_id },
+								};
+								queryDynamo(checkIfUserExists, callback, function(user) {
+									if (user.Count == 0) {
+										let newInternalUserParams = {
+											Item: {
+												user_id: uuid.v4(),
+												user_system_status: 'ACTIVE',
+												user_status: event.users_array[i].user_status,
+												user_type: 'INTERNAL',
+												projects: [],
+												user_name: event.users_array[i].user_name,
+												user_email_id: event.users_array[i].user_email_id,
+												organisation_id: event.organisation_id,
+												// role_id: event.role_id,
+												designation: event.users_array[i].designation, //role.Items[0].role_name ,
+												contact_number: event.users_array[i].contact_number,
+												country_code: event.users_array[i].country_code,
+												no_of_pending_queries: 0,
+											},
+											TableName: 'XcelAudit_UserPortal_Users',
+											ConditionExpression: 'attribute_not_exists(user_id)',
+											ReturnValues: 'ALL_OLD',
+										};
+										if (event.user_status == 'SUPER_ADMIN') {
+											newInternalUserParams.Item.projects = creater.Items[0].projects;
+										}
+										createCognitoUser(event.users_array[i].user_email_id, constants.userPortalCognitoPool, callback, function(cognitodata) {
+											insertIntoDynamo(newInternalUserParams, callback, function(InsertedData) {
+												auditLog(event.creater_email_id.trim(), 'Created Internal User -' + event.users_array[i].user_name, event.organisation_id, null, null, function(value) {
+													res({ status: 'Success', Status_Message: 'Internal User Created Successfully!!' });
+												});
+											});
+										});
+									}
+									else {
+										res('User With Email Id: ' + event.user_email_id + ' already Exists');
+										already_existing_users.push(event.users_array[i]);
+									}
+								});
+							}));
+						}
+						Promise.all(promise_array).then((data) => {
+							if (already_existing_users.length == event.users_array.length) {
+								callback(new Error(data));
+							}
+							else {
+								callback(null, { status: 'Success', Status_Message: "Internal User's Created Successfully!!" });
+							}
+						});
+					}
+					else {
+						callback(new Error("Creater Doesn't Exist"));
+					}
+				});
+			}
+			else {
+				callback(new Error('ACTIVE Organisation with ID: ' + event.organisation_id + " doesn't Exists!"));
+			}
+		});
+	}
+	else {
+		callback(new Error("Empty Fields Occurred Can't Create Roles"));
+	}
+}
+
+function listInternalUsers(event, context, callback) {
+	if (event.organisation_id.trim().length != 0) {
+		let getInternalUsers = {
+			TableName: 'XcelAudit_UserPortal_Users',
+			IndexName: 'user_type-index',
+			KeyConditionExpression: '#organisation_id = :organisation_id and #user_type = :user_type',
+			ExpressionAttributeNames: {
+				'#organisation_id': 'organisation_id',
+				'#user_type': 'user_type',
+			},
+			ExpressionAttributeValues: {
+				':organisation_id': event.organisation_id,
+				':user_type': 'INTERNAL',
+			},
+		};
+		queryDynamo(getInternalUsers, callback, function(Users) {
+			if (Users.Count > 0) {
+				let response = {};
+				response.items = Users.Items;
+				if (Users.LastEvaluatedKey != undefined && Users.LastEvaluatedKey != null) {
+					response.next_token = Buffer.from(JSON.stringify(Users.LastEvaluatedKey)).toString('base64');
+				}
+				callback(null, {
+					status: 'SUCCESS',
+					data: response,
+				});
+			}
+			else {
+				callback(new Error('Currently there are no Internal Users'));
+			}
+		});
+	}
+	else {
+		callback(new Error('Kindly Enter Organisation ID to get list Internal Users'));
+	}
+}
+
+function updateInternalUser(event, context, callback) {
+	if (event.user_id.trim().length != 0) {
+		let checkIfCreaterExists = {
+			TableName: 'XcelAudit_UserPortal_Users',
+			IndexName: 'user_email_id-index',
+			KeyConditionExpression: '#user_email_id = :user_email_id',
+			ExpressionAttributeNames: { '#user_email_id': 'user_email_id' },
+			ExpressionAttributeValues: { ':user_email_id': event.creater_email_id },
+		};
+		queryDynamo(checkIfCreaterExists, callback, function(creater) {
+			if (creater.Count > 0) {
+				let checkIfUserExists = {
+					TableName: 'XcelAudit_UserPortal_Users',
+					KeyConditionExpression: '#user_id = :user_id',
+					FilterExpression: 'user_type = :user_type',
+					ExpressionAttributeNames: { '#user_id': 'user_id' },
+					ExpressionAttributeValues: { ':user_id': event.user_id, ':user_type': 'INTERNAL' },
+				};
+				queryDynamo(checkIfUserExists, callback, function(user) {
+					if (user.Count > 0) {
+						let UpdateExpression = 'set';
+						let ExpressionAttributeNames = {};
+						let ExpressionAttributeValues = {};
+						let checkForRole = false;
+						let roleChecked = true;
+						let updateProjectStatus = false;
+						let projects = [];
+						for (const field in event) {
+							if (field == 'user_id' || field == 'command' || field == 'creater_email_id' || field == 'organisation_id') {
+								continue;
+							}
+							else {
+								if (event[field].trim().length != 0) {
+									if (field === 'role_name') {
+										// checkForRole = true;
+										// roleChecked = false;
+										UpdateExpression += ` #${field} = :${field} ,`;
+										ExpressionAttributeNames['#' + field] = field;
+										ExpressionAttributeValues[':' + field] = event[field];
+									}
+									else if (field == 'user_status' && event[field] == 'SUPER_ADMIN') {
+										UpdateExpression += ` #${field} = :${field} ,#projects=:projects,`;
+										ExpressionAttributeNames['#' + field] = field;
+										ExpressionAttributeNames['#projects'] = 'projects';
+										ExpressionAttributeValues[':' + field] = event[field];
+										projects = creater.Items[0].projects;
+										ExpressionAttributeValues[':projects'] = creater.Items[0].projects;
+									}
+									else if (field == 'user_system_status') {
+										updateProjectStatus = true;
+										UpdateExpression += ` #${field} = :${field} ,`;
+										ExpressionAttributeNames['#' + field] = field;
+										ExpressionAttributeValues[':' + field] = event[field];
+									}
+									else {
+										UpdateExpression += ` #${field} = :${field} ,`;
+										ExpressionAttributeNames['#' + field] = field;
+										ExpressionAttributeValues[':' + field] = event[field];
+									}
+								}
+								else {
+									callback(new Error(field + ' cannot be updated to empty value'));
+								}
+							}
+						}
+						if (UpdateExpression != 'set') {
+							if (projects.length == 0) {
+								projects = user.Items[0].projects;
+							}
+							if (checkForRole) {
+								let checkIfRoleExists = {
+									TableName: 'XcelAudit_Roles',
+									IndexName: 'organisation_id-index',
+									FilterExpression: 'role_name = :role_name',
+									KeyConditionExpression: '#organisation_id = :organisation_id',
+									ExpressionAttributeNames: { '#organisation_id': 'organisation_id' },
+									ExpressionAttributeValues: {
+										':organisation_id': event.organisation_id,
+										':role_name': event.role_name,
+									},
+								};
+								queryDynamo(checkIfRoleExists, callback, function(role) {
+									if (role.Count > 0) {
+										UpdateExpression += `#role_id = :role_id ,`;
+										ExpressionAttributeNames['#role_id'] = 'role_id';
+										ExpressionAttributeValues[':role_id'] = role.Items[0].role_id;
+										UpdateExpression = UpdateExpression.slice(0, -1);
+										let updateInternalUserParams = {
+											TableName: 'XcelAudit_UserPortal_Users',
+											Key: {
+												user_id: event.user_id,
+											},
+											UpdateExpression: UpdateExpression,
+											ExpressionAttributeNames: ExpressionAttributeNames,
+											ExpressionAttributeValues: ExpressionAttributeValues,
+											ReturnValues: 'UPDATED_NEW',
+										};
+										updateDynamoRecord(updateInternalUserParams, callback, function(data) {
+											if (updateProjectStatus) {
+												updateAllProjectStatusForMember(projects, event.user_id, event.user_system_status, callback, function(data) {
+													auditLog(event.creater_email_id.trim(), 'Updated Internal User - ' + user.Items[0].user_name, event.organisation_id, null, null, function(value) {
+														callback(null, { status: 'Success', Status_Message: ' updated internal Successfully!!' });
+													});
+												});
+											}
+											else {
+												auditLog(event.creater_email_id.trim(), 'Updated Internal User - ' + event.user_id, event.organisation_id, null, null, function(value) {
+													callback(null, { status: 'Success', Status_Message: ' updated internal Successfully!!' });
+												});
+											}
+										});
+									}
+									else {
+										callback(new Error('Role with Name : ' + event.role_name + " doesn't exist!"));
+									}
+								});
+							}
+							if (roleChecked) {
+								UpdateExpression = UpdateExpression.slice(0, -1);
+								let updateInternalUserParams = {
+									TableName: 'XcelAudit_UserPortal_Users',
+									Key: {
+										user_id: event.user_id,
+									},
+									UpdateExpression: UpdateExpression,
+									ExpressionAttributeNames: ExpressionAttributeNames,
+									ExpressionAttributeValues: ExpressionAttributeValues,
+									ReturnValues: 'UPDATED_NEW',
+								};
+								updateDynamoRecord(updateInternalUserParams, callback, function(data) {
+									if (updateProjectStatus) {
+										updateAllProjectStatusForMember(projects, event.user_id, event.user_system_status, callback, function(data) {
+											auditLog(event.creater_email_id.trim(), 'Updated Internal User - ' + user.Items[0].user_name, event.organisation_id, null, null, function(value) {
+												callback(null, { status: 'Success', Status_Message: ' updated internal Successfully!!' });
+											});
+										});
+									}
+									else {
+										auditLog(event.creater_email_id.trim(), 'Updated Internal User - ' + user.Items[0].user_name, event.organisation_id, null, null, function(value) {
+											callback(null, { status: 'Success', Status_Message: ' updated internal Successfully!!' });
+										});
+									}
+								});
+							}
+						}
+						else {
+							callback(new Error('User with User ID: ' + event.user_id + ' cannot be updated'));
+						}
+					}
+					else {
+						callback(new Error('User with User ID: ' + event.user_id + " doesn't Exist!!"));
+					}
+				});
+			}
+			else {
+				callback(new Error('Creater Details Unable to fetch'));
+			}
+		});
+	}
+	else {
+		callback(new Error('Kindly,Enter User ID to update Internal User'));
+	}
+}
+
+const delete_cognito_user = async (userName, poolId, callback, callbackFn) => {
+	var params = {
+		UserPoolId: poolId,
+		Username: userName
+	};
+	cognitoidentityserviceprovider.adminDeleteUser(params, function(err, data) {
+		if (err) {
+			logErrorMsg(err, params, err.stack, callback, function(data) {
+				callback(err);
+			});
+		}
+		else {
+			if (typeof callbackFn === 'function') {
+				callbackFn(data);
+			}
+		}
+	});
+};
+
+function delete_internal_or_external_user(event, context, callback) {
+	if (event.user_id.trim().length != 0) {
+		let getInternalUsers = {
+			TableName: 'XcelAudit_UserPortal_Users',
+			KeyConditionExpression: '#user_id = :user_id',
+			ExpressionAttributeNames: {
+				'#user_id': "user_id",
+			},
+			ExpressionAttributeValues: {
+				':user_id': event.user_id,
+			},
+		};
+		queryDynamo(getInternalUsers, callback, function(Users) {
+			if (Users.Count > 0) {
+				let deleteInternalUserParams = {
+					TableName: 'XcelAudit_UserPortal_Users',
+					Key: {
+						user_id: event.user_id
+					}
+				};
+				delete_cognito_user(Users.Items[0].user_email_id, "ap-south-1_7jXvSYbrr", callback, function(data) {
+					deleteFromDynamo(deleteInternalUserParams, callback, function(Users) {
+						callback(null, { status: 'Success', Status_Message: "User Deleted Successfully!!" });
+					});
+				});
+			}
+			else {
+				callback(new Error('User With ID :' + event.user_id + " Not Found"));
+			}
+		});
+	}
+	else {
+		callback(new Error('Kindly Enter Organisation ID to get list Internal Users'));
+	}
+}
+
+function updateAllProjectStatusForMember(projects, member_id, member_status, callback, callbackfn) {
+	if (projects.length != 0) {
+		let promise_array = [];
+		for (let i = 0; i < projects.length; i++) {
+			promise_array.push(
+				new Promise((resolve, reject) => {
+					let checkIfProjectExists = {
+						TableName: 'XcelAudit_Projects',
+						KeyConditionExpression: '#project_id = :project_id',
+						ExpressionAttributeNames: { '#project_id': 'project_id' },
+						ExpressionAttributeValues: { ':project_id': projects[i] },
+					};
+					queryDynamo(checkIfProjectExists, callback, function(project) {
+						if (project.Count > 0) {
+							for (let j = 0; j < project.Items[0].project_members.length; j++) {
+								if (project.Items[0].project_members[j].user_id == member_id) {
+									project.Items[0].project_members[j].member_status = member_status;
+								}
+							}
+							let updateProjectParams = {
+								TableName: 'XcelAudit_Projects',
+								Key: {
+									project_id: projects[i],
+								},
+								UpdateExpression: 'set project_members=:project_members',
+								ExpressionAttributeValues: { ':project_members': project.Items[0].project_members },
+								ReturnValues: 'UPDATED_NEW',
+							};
+							updateDynamoRecord(updateProjectParams, callback, function(data) {
+								resolve(data);
+							});
+						}
+						else {
+							resolve("data");
+						}
+					});
+				})
+			);
+		}
+		Promise.all(promise_array).then(data => {
+			callbackfn("Updated Projects Successfully!!!");
+		});
+	}
+	else {
+		callbackfn('No Projects To Update');
+	}
+}
+
+function createExternalUser(event, context, callback) {
+	let checkEmptyFields = true;
+	for (const field in event) {
+		if (typeof event[field] == 'string') {
+			if (event[field].trim().length == 0) {
+				checkEmptyFields = false;
+			}
+		}
+	}
+	if (checkEmptyFields) {
+		let checkIfOrganisationExists = {
+			TableName: 'XcelAudit_Organisations',
+			KeyConditionExpression: '#organisation_id = :organisation_id',
+			ExpressionAttributeNames: { '#organisation_id': 'organisation_id' },
+			ExpressionAttributeValues: { ':organisation_id': event.organisation_id },
+		};
+		queryDynamo(checkIfOrganisationExists, callback, function(organisation) {
+			if (organisation.Count > 0) {
+				let users_promise_array = [];
+				for (let i = 0; i < event.users_array.length; i++) {
+					users_promise_array.push(new Promise((res, rej) => {
+						let checkIfClientExists = {
+							TableName: 'XcelAudit_Clients',
+							KeyConditionExpression: '#client_id = :client_id',
+							ExpressionAttributeNames: { '#client_id': 'client_id' },
+							ExpressionAttributeValues: { ':client_id': event.users_array[i].client_id },
+						};
+						queryDynamo(checkIfClientExists, callback, function(Client) {
+							if (Client.Count > 0) {
+								let checkIfUserExists = {
+									TableName: 'XcelAudit_UserPortal_Users',
+									IndexName: 'user_email_id-index',
+									KeyConditionExpression: '#user_email_id = :user_email_id',
+									ExpressionAttributeNames: { '#user_email_id': 'user_email_id' },
+									ExpressionAttributeValues: { ':user_email_id': event.users_array[i].user_email_id },
+								};
+								queryDynamo(checkIfUserExists, callback, function(user) {
+									if (user.Count == 0) {
+										let newExternalUserParams = {
+											Item: {
+												user_id: uuid.v4(),
+												user_system_status: 'ACTIVE',
+												user_status: 'NORMAL_USER',
+												user_type: 'EXTERNAL',
+												projects: [],
+												user_name: event.users_array[i].user_name,
+												user_email_id: event.users_array[i].user_email_id,
+												organisation_id: event.organisation_id,
+												contact_number: event.users_array[i].contact_number,
+												country_code: event.users_array[i].country_code,
+												client_id: Client.Items[0].client_id,
+												client_name: Client.Items[0].client_name,
+												no_of_pending_queries: 0,
+												role_name: event.users_array[i].role_name
+											},
+											TableName: 'XcelAudit_UserPortal_Users',
+											ConditionExpression: 'attribute_not_exists(user_id)',
+											ReturnValues: 'ALL_OLD',
+										};
+										createCognitoUser(event.users_array[i].user_email_id, constants.userPortalCognitoPool, callback, function(cognitodata) {
+											insertIntoDynamo(newExternalUserParams, callback, function(InsertedData) {
+												auditLog(event.users_array[i].user_email_id.trim(), 'Created External User - ' + event.users_array[i].user_name, event.organisation_id, Client.Items[0].client_id, null, function(value) {
+													res(value);
+												});
+											});
+										});
+									}
+									else {
+										rej('User With Email Id: ' + event.users_array[i].user_email_id + ' already Exists');
+									}
+								});
+							}
+							else {
+								callback(new Error('Client With ID: ' + event.users_array[i].client_id + " Doesn't Exist!!"));
+							}
+						});
+					}));
+				}
+				Promise.all(users_promise_array).then((data) => {
+					callback(null, { status: 'Success', Status_Message: 'External User Created Successfully!!' });
+				}).catch(err => callback(new Error(err)));
+			}
+			else {
+				callback(new Error('Organisation with ID : ' + event.organisation_id + " Fields Occurred Can't Create User"));
+			}
+		});
+	}
+	else {
+		callback(new Error("Empty Fields Occurred Can't Create User"));
+	}
+}
+
+function listExternalUsers(event, context, callback) {
+	if (event.organisation_id.trim().length != 0) {
+		let getExternalUsers = {
+			TableName: 'XcelAudit_UserPortal_Users',
+			IndexName: 'user_type-index',
+			KeyConditionExpression: '#organisation_id = :organisation_id and #user_type = :user_type',
+			ExpressionAttributeNames: {
+				'#organisation_id': 'organisation_id',
+				'#user_type': 'user_type',
+			},
+			ExpressionAttributeValues: {
+				':organisation_id': event.organisation_id,
+				':user_type': 'EXTERNAL',
+			},
+		};
+		queryDynamo(getExternalUsers, callback, function(Users) {
+			if (Users.Count > 0) {
+				let response = {};
+				response.items = Users.Items;
+				if (Users.LastEvaluatedKey != undefined && Users.LastEvaluatedKey != null) {
+					response.next_token = Buffer.from(JSON.stringify(Users.LastEvaluatedKey)).toString('base64');
+				}
+				callback(null, {
+					status: 'SUCCESS',
+					data: response,
+				});
+			}
+			else {
+				callback(new Error('Currently there are no external users'));
+			}
+		});
+	}
+	else {
+		callback(new Error('Kindly Enter Organisation ID to get list External Users'));
+	}
+}
+
+function updateExternalUser(event, context, callback) {
+	if (event.user_id.trim().length != 0) {
+		let checkIfUserExists = {
+			TableName: 'XcelAudit_UserPortal_Users',
+			KeyConditionExpression: '#user_id = :user_id',
+			FilterExpression: 'user_type = :user_type',
+			ExpressionAttributeNames: { '#user_id': 'user_id' },
+			ExpressionAttributeValues: { ':user_id': event.user_id, ':user_type': 'EXTERNAL' },
+		};
+		queryDynamo(checkIfUserExists, callback, function(user) {
+			if (user.Count > 0) {
+				let UpdateExpression = 'set';
+				let ExpressionAttributeNames = {};
+				let ExpressionAttributeValues = {};
+				for (const field in event) {
+					if (field == 'user_id' || field == 'command' || field == 'creater_email_id' || field == 'organisation_id') {
+						continue;
+					}
+					else {
+						if (event[field].trim().length != 0) {
+							UpdateExpression += ` #${field} = :${field} ,`;
+							ExpressionAttributeNames['#' + field] = field;
+							ExpressionAttributeValues[':' + field] = event[field];
+						}
+						else {
+							callback(new Error(field + ' cannot be updated to empty value'));
+						}
+					}
+				}
+				if (UpdateExpression != 'set') {
+					console.log("updatedExpression", UpdateExpression);
+					UpdateExpression = UpdateExpression.slice(0, -1);
+					let updateAuditFormParams = {
+						TableName: 'XcelAudit_UserPortal_Users',
+						Key: {
+							user_id: event.user_id,
+						},
+						UpdateExpression: UpdateExpression,
+						ExpressionAttributeNames: ExpressionAttributeNames,
+						ExpressionAttributeValues: ExpressionAttributeValues,
+						ReturnValues: 'UPDATED_NEW',
+					};
+					updateDynamoRecord(updateAuditFormParams, callback, function(data) {
+						auditLog(event.creater_email_id.trim(), 'Updated External User - ' + user.Items[0].user_name, event.organisation_id, null, null, function(value) {
+							callback(null, { status: 'Success', Status_Message: ' updated External Successfully!!' });
+						});
+					});
+				}
+				else {
+					callback(new Error('User with User ID: ' + event.user_id + ' cannot be updated'));
+				}
+			}
+			else {
+				callback(new Error('User with User ID: ' + event.user_id + " doesn't Exist!!"));
+			}
+		});
+	}
+	else {
+		callback(new Error('Kindly,Enter User ID to update External User'));
+	}
+}
+
+function createRole(event, context, callback) {
+	let checkEmptyFields = true;
+	for (const field in event) {
+		if (typeof event[field] == 'string') {
+			if (event[field].trim().length == 0) {
+				checkEmptyFields = false;
+			}
+		}
+	}
+	if (checkEmptyFields) {
+		let checkIfOrganisationExists = {
+			TableName: 'XcelAudit_Organisations',
+			KeyConditionExpression: '#organisation_id = :organisation_id',
+			ExpressionAttributeNames: { '#organisation_id': 'organisation_id' },
+			ExpressionAttributeValues: { ':organisation_id': event.organisation_id },
+		};
+		queryDynamo(checkIfOrganisationExists, callback, function(organisation) {
+			if (organisation.Count > 0) {
+				if (organisation.Items[0].organisation_status == 'ACTIVE') {
+					let checkIfRoleExists = {
+						TableName: 'XcelAudit_Roles',
+						IndexName: 'organisation_id-index',
+						FilterExpression: 'role_name = :role_name',
+						KeyConditionExpression: '#organisation_id = :organisation_id',
+						ExpressionAttributeNames: { '#organisation_id': 'organisation_id' },
+						ExpressionAttributeValues: {
+							':organisation_id': event.organisation_id,
+							':role_name': event.role_name,
+						},
+					};
+					queryDynamo(checkIfRoleExists, callback, function(role) {
+						if (role.Count == 0) {
+							let newRoleParams = {
+								Item: {
+									role_id: uuid.v4(),
+									role_name: event.role_name,
+									role_description: event.role_description,
+									organisation_id: event.organisation_id,
+									organisation_name: organisation.Items[0].organisation_name,
+									creater_email_id: event.creater_email_id,
+									role_status: 'ACTIVE',
+								},
+								TableName: 'XcelAudit_Roles',
+								ConditionExpression: 'attribute_not_exists(role_id)',
+								ReturnValues: 'ALL_OLD',
+							};
+							insertIntoDynamo(newRoleParams, callback, function(InsertedData) {
+								auditLog(event.creater_email_id.trim(), 'Created Role -' + event.role_name, event.organisation_id, null, null, function(value) {
+									callback(null, { status: 'Success', Status_Message: 'Role Created Successfully!!' });
+								});
+							});
+						}
+						else {
+							callback(new Error('Role with Name: ' + event.role_name + ' already Exists for ' + organisation.Items[0].organisation_name));
+						}
+					});
+				}
+				else {
+					callback(new Error('Cannot Create Role For Inactive Organisation'));
+				}
+			}
+			else {
+				callback(new Error('Organisation with ID: ' + event.organisation_id + " doesn't Exists"));
+			}
+		});
+	}
+	else {
+		callback(new Error("Empty Fields Occurred Can't Create Roles"));
+	}
+}
+
+function listRoles(event, context, callback) {
+	if (event.organisation_id.trim().length != 0) {
+		let getRoles = {
+			TableName: 'XcelAudit_Roles',
+			IndexName: 'organisation_id-index',
+			KeyConditionExpression: '#organisation_id = :organisation_id',
+			ExpressionAttributeNames: { '#organisation_id': 'organisation_id' },
+			ExpressionAttributeValues: { ':organisation_id': event.organisation_id },
+		};
+		if (event.next_token != null && event.next_token != undefined) {
+			getRoles.ExclusiveStartKey = JSON.parse(Buffer.from(event.next_token, 'base64').toString('ascii'));
+		}
+		queryDynamo(getRoles, callback, function(data) {
+			if (data.Count > 0) {
+				let response = {};
+				response.items = data.Items;
+				if (data.LastEvaluatedKey != undefined && data.LastEvaluatedKey != null) {
+					response.next_token = Buffer.from(JSON.stringify(data.LastEvaluatedKey)).toString('base64');
+				}
+				callback(null, {
+					status: 'SUCCESS',
+					data: response,
+				});
+			}
+			else {
+				callback(new Error('No Roles Found'));
+			}
+		});
+	}
+	else {
+		callback(new Error('Kindly Enter Organisation id to list roles'));
+	}
+}
+
+function updateRole(event, context, callback) {
+	let checkEmptyFields = true;
+	for (const field in event) {
+		if (typeof event[field] == 'string') {
+			if (event[field].trim().length == 0) {
+				checkEmptyFields = false;
+			}
+		}
+	}
+	if (checkEmptyFields) {
+		let checkIfRoleExists = {
+			TableName: 'XcelAudit_Roles',
+			KeyConditionExpression: '#role_id = :role_id',
+			ExpressionAttributeNames: { '#role_id': 'role_id' },
+			ExpressionAttributeValues: { ':role_id': event.role_id },
+		};
+		queryDynamo(checkIfRoleExists, callback, function(role) {
+			if (role.Count > 0) {
+				let UpdateExpression = 'set';
+				let ExpressionAttributeNames = {};
+				let ExpressionAttributeValues = {};
+				for (const field in event) {
+					if (field == 'role_name' || field == 'role_description' || field == 'role_status') {
+						UpdateExpression += ` #${field} = :${field} ,`;
+						ExpressionAttributeNames['#' + field] = field;
+						ExpressionAttributeValues[':' + field] = event[field];
+					}
+				}
+				if (UpdateExpression != 'set') {
+					UpdateExpression = UpdateExpression.slice(0, -1);
+					let updateRoleParams = {
+						TableName: 'XcelAudit_Roles',
+						Key: {
+							role_id: event.role_id,
+						},
+						UpdateExpression: UpdateExpression,
+						ExpressionAttributeNames: ExpressionAttributeNames,
+						ExpressionAttributeValues: ExpressionAttributeValues,
+						ReturnValues: 'UPDATED_NEW',
+					};
+					updateDynamoRecord(updateRoleParams, callback, function(data) {
+						auditLog(event.creater_email_id.trim(), 'Updated Role - ' + role.Items[0].role_name, event.organisation_id, null, null, function(value) {
+							callback(null, { status: 'Success', Status_Message: ' updated role Successfully!!' });
+						});
+					});
+				}
+				else {
+					callback(new Error('Role Cannot be updated !!!'));
+				}
+			}
+			else {
+				callback(new Error('Role with ID : ' + event.role_id + " doesn't Exist!!"));
+			}
+		});
+	}
+	else {
+		callback(new Error("Empty Fields Occurred Can't Create Roles"));
+	}
+}
+
+function createClient(event, context, callback) {
+	let checkEmptyFields = true;
+	for (const field in event) {
+		if (typeof event[field] == 'string') {
+			if (event[field].trim().length == 0) {
+				checkEmptyFields = false;
+			}
+		}
+	}
+	if (checkEmptyFields) {
+		let checkIfOrganisationExists = {
+			TableName: 'XcelAudit_Organisations',
+			KeyConditionExpression: '#organisation_id = :organisation_id',
+			ExpressionAttributeNames: { '#organisation_id': 'organisation_id' },
+			ExpressionAttributeValues: { ':organisation_id': event.organisation_id },
+		};
+		queryDynamo(checkIfOrganisationExists, callback, function(organisation) {
+			if (organisation.Count > 0) {
+				let checkIfClientCINExists = {
+					TableName: 'XcelAudit_Clients',
+					IndexName: 'CIN-index',
+					KeyConditionExpression: '#organisation_id = :organisation_id and #CIN = :CIN',
+					ExpressionAttributeNames: {
+						'#organisation_id': 'organisation_id',
+						'#CIN': 'CIN',
+					},
+					ExpressionAttributeValues: {
+						':organisation_id': event.organisation_id,
+						':CIN': event.CIN,
+					},
+				};
+				queryDynamo(checkIfClientCINExists, callback, function(CIN) {
+					if (CIN.Count == 0) {
+						let checkIfClientNameExists = {
+							TableName: 'XcelAudit_Clients',
+							IndexName: 'client_name-index',
+							KeyConditionExpression: '#client_name = :client_name and #organisation_id = :organisation_id',
+							ExpressionAttributeNames: {
+								'#client_name': 'client_name',
+								'#organisation_id': 'organisation_id',
+							},
+							ExpressionAttributeValues: {
+								':client_name': event.client_name,
+								':organisation_id': event.organisation_id,
+							},
+						};
+						queryDynamo(checkIfClientNameExists, callback, function(client) {
+							if (client.Count == 0) {
+								let newClientParams = {
+									Item: {
+										client_id: uuid.v4(),
+										organisation_id: event.organisation_id,
+										client_code: event.client_code,
+										CIN: event.CIN,
+										Address: event.Address,
+										state: event.state,
+										country: event.country,
+										zip_code: event.zip_code,
+										data_center: event.data_center,
+										contact_person_name: event.contact_person_name,
+										contact_person_email_id: event.contact_person_email_id,
+										contact_person_phone: event.contact_person_phone,
+										contact_person_country_code: event.contact_person_country_code,
+										creater_email_id: event.creater_email_id,
+										client_status: 'ACTIVE',
+										client_name: event.client_name,
+										projects: [],
+									},
+									TableName: 'XcelAudit_Clients',
+									ConditionExpression: 'attribute_not_exists(project_id)',
+									ReturnValues: 'ALL_OLD',
+								};
+								insertIntoDynamo(newClientParams, callback, function(InsertedData) {
+									let clients = organisation.Items[0].clients;
+									clients.push(newClientParams.Item.client_id);
+									let updateOrganisationClientsParams = {
+										TableName: 'XcelAudit_Organisations',
+										Key: {
+											organisation_id: event.organisation_id
+										},
+										UpdateExpression: 'set clients = :clients',
+										ExpressionAttributeValues: { ':clients': clients },
+										ReturnValues: 'UPDATED_NEW',
+									};
+									updateDynamoRecord(updateOrganisationClientsParams, callback, function(data) {
+										auditLog(event.creater_email_id.trim(), 'Created Client - ' + event.client_name, event.organisation_id, newClientParams.Item.client_id, "", function(value) {
+											callback(null, { status: 'Success', Status_Message: 'Client Added Successfully!!' });
+										});
+									});
+								});
+							}
+							else {
+								callback(new Error('Client with name : ' + event.client_name + ' already exists!'));
+							}
+						});
+					}
+					else {
+						callback(new Error('Client with CIN : ' + event.CIN + ' already exists!'));
+					}
+				});
+			}
+			else {
+				callback(new Error('Organisation with ID : ' + event.organisation_id + ' doesnot exists!'));
+			}
+		});
+	}
+	else {
+		callback(new Error('Empty Fields Found!!! Cannot create Client'));
+	}
+}
+
+function listClients(event, context, callback) {
+	if (event.organisation_id.trim().length != 0) {
+		let getClients = {
+			TableName: 'XcelAudit_Clients',
+			IndexName: 'organisation_id-index',
+			KeyConditionExpression: '#organisation_id = :organisation_id',
+			ExpressionAttributeNames: { '#organisation_id': 'organisation_id' },
+			ExpressionAttributeValues: { ':organisation_id': event.organisation_id },
+		};
+		queryDynamo(getClients, callback, function(data) {
+			if (data.Count > 0) {
+				let response = {};
+				response.items = data.Items;
+				if (data.LastEvaluatedKey != undefined && data.LastEvaluatedKey != null) {
+					response.next_token = Buffer.from(JSON.stringify(data.LastEvaluatedKey)).toString('base64');
+				}
+				callback(null, {
+					status: 'SUCCESS',
+					data: response,
+				});
+			}
+			else {
+				callback(new Error('Currently there are no ACTIVE clients for this organisation'));
+			}
+		});
+	}
+	else {
+		callback(new Error('Kindly Enter Creater Organisation ID to get list of Clients'));
+	}
+}
+
+function updateClient(event, context, callback) {
+	let checkEmptyFields = true;
+	for (const field in event) {
+		if (typeof event[field] == 'string') {
+			if (event[field].trim().length == 0) {
+				checkEmptyFields = false;
+			}
+		}
+	}
+	if (checkEmptyFields) {
+		let checkIfClientExists = {
+			TableName: 'XcelAudit_Clients',
+			KeyConditionExpression: '#client_id = :client_id',
+			ExpressionAttributeNames: { '#client_id': 'client_id' },
+			ExpressionAttributeValues: { ':client_id': event.client_id },
+		};
+		queryDynamo(checkIfClientExists, callback, function(Client) {
+			if (Client.Count > 0) {
+				let UpdateExpression = 'set';
+				let ExpressionAttributeNames = {};
+				let ExpressionAttributeValues = {};
+				for (const field in event) {
+					if (field == 'client_id' || field == 'command' || field == 'creater_email_id' || field == 'organisation_id') {
+						continue;
+					}
+					else {
+						if (event[field].trim().length != 0) {
+							if (field == 'organisation_name') {
+								let checkIfOrganisationExists = {
+									TableName: 'XcelAudit_Organisations',
+									KeyConditionExpression: '#organisation_id = :organisation_id',
+									ExpressionAttributeNames: { '#organisation_id': 'organisation_id' },
+									ExpressionAttributeValues: { ':organisation_id': event.organisation_id },
+								};
+								queryDynamo(checkIfOrganisationExists, callback, function(organisation) {
+									if (organisation.Count > 0) {
+										UpdateExpression += ` #${field} = :${field} ,`;
+										ExpressionAttributeNames['#' + field] = field;
+										ExpressionAttributeValues[':' + field] = event[field];
+									}
+									else {
+										callback(new Error('Organisation with ID: ' + event.organisation_id + ' doesnot Exist'));
+									}
+								});
+							}
+							else {
+								UpdateExpression += ` #${field} = :${field} ,`;
+								ExpressionAttributeNames['#' + field] = field;
+								ExpressionAttributeValues[':' + field] = event[field];
+							}
+						}
+						else {
+							callback(new Error(field + ' cannot be updated to empty value'));
+						}
+					}
+				}
+				if (UpdateExpression != 'set') {
+					UpdateExpression = UpdateExpression.slice(0, -1);
+					let updateClientParams = {
+						TableName: 'XcelAudit_Clients',
+						Key: {
+							client_id: event.client_id,
+						},
+						UpdateExpression: UpdateExpression,
+						ExpressionAttributeNames: ExpressionAttributeNames,
+						ExpressionAttributeValues: ExpressionAttributeValues,
+						ReturnValues: 'UPDATED_NEW',
+					};
+					updateDynamoRecord(updateClientParams, callback, function(data) {
+						auditLog(event.creater_email_id.trim(), 'Updated Client - ' + Client.Items[0].client_name, event.organisation_id, event.client_id, null, function(value) {
+							callback(null, { status: 'Success', Status_Message: ' updated client Successfully!!' });
+						});
+					});
+				}
+				else {
+					callback(new Error('Client Cannot be updated !!!'));
+				}
+			}
+			else {
+				callback(new Error('Client with ID: ' + event.client_id + ' not found!'));
+			}
+		});
+	}
+	else {
+		callback(new Error('Empty Fields Found!!! Cannot create Client'));
+	}
+}
+
+function delete_client(event, context, callback) {
+	let checkEmptyFields = true;
+	for (const field in event) {
+		if (typeof event[field] == 'string') {
+			if (event[field].trim().length == 0) {
+				checkEmptyFields = false;
+			}
+		}
+	}
+	if (checkEmptyFields) {
+		let checkIfClientExists = {
+			TableName: 'XcelAudit_Clients',
+			KeyConditionExpression: '#client_id = :client_id',
+			ExpressionAttributeNames: { '#client_id': 'client_id' },
+			ExpressionAttributeValues: { ':client_id': event.client_id },
+		};
+		queryDynamo(checkIfClientExists, callback, function(client) {
+			if (client.Count > 0) {
+				if (client.Items[0].projects.length > 0) {
+					let projects_promises = [];
+					for (let i = 0; i < client.Items[0].projects.length; i++) {
+						projects_promises.push(new Promise((project_res, project_rej) => {
+							let checkIfProjectExists = {
+								TableName: 'XcelAudit_Projects',
+								KeyConditionExpression: '#project_id = :project_id',
+								ExpressionAttributeNames: { '#project_id': 'project_id' },
+								ExpressionAttributeValues: { ':project_id': client.Items[0].projects[i] },
+							};
+							queryDynamo(checkIfProjectExists, callback, function(project) {
+								if (project.Count > 0) {
+									let checkIfProjectExists = {
+										TableName: 'XcelAudit_Stages_And_Substages',
+										IndexName: "project_id-index",
+										KeyConditionExpression: '#project_id = :project_id',
+										ExpressionAttributeNames: { '#project_id': 'project_id' },
+										ExpressionAttributeValues: { ':project_id': client.Items[0].projects[i] },
+									};
+									queryAllDynamo(checkIfProjectExists, callback, function(stagesAndSubstages) {
+										if (stagesAndSubstages.Count > 0) {
+											let stagesAndSubstages25Each = [];
+											while (stagesAndSubstages.Items.length) {
+												stagesAndSubstages25Each.push(stagesAndSubstages.Items.splice(0, 25));
+											}
+											let stagesAndSubstagesDeletioPromiseArray = [];
+											for (let i = 0; i < stagesAndSubstages25Each.length; i++) {
+												stagesAndSubstagesDeletioPromiseArray.push(new Promise((d_res, d_rej) => {
+													let batchDeleteParams = {
+														RequestItems: {
+															XcelAudit_Stages_And_Substages: []
+														}
+													};
+													for (let j = 0; j < stagesAndSubstages25Each[i].length; j++) {
+														let singleStageOrSubstage = stagesAndSubstages25Each[i][j];
+														let Item = {
+															stage_id: singleStageOrSubstage.stage_id
+														};
+														batchDeleteParams.RequestItems.XcelAudit_Stages_And_Substages.push({
+															DeleteRequest: {
+																Key: Item
+															}
+														});
+													}
+													batchDynamoOperation(batchDeleteParams, callback, function(data) {
+														d_res(data);
+													});
+												}));
+											}
+											Promise.all(stagesAndSubstagesDeletioPromiseArray).then((data) => {
+												console.log("DELETED STAGES");
+												let getAllStepsParams = {
+													TableName: 'XcelAudit_Steps_FormFields',
+													IndexName: "project_id-index",
+													KeyConditionExpression: '#project_id = :project_id',
+													ExpressionAttributeNames: { '#project_id': 'project_id' },
+													ExpressionAttributeValues: { ':project_id': client.Items[0].projects[i] },
+												};
+												queryAllDynamo(getAllStepsParams, callback, function(steps) {
+													if (steps.Count > 0) {
+														let steps25Each = [];
+														while (steps.Items.length) {
+															steps25Each.push(steps.Items.splice(0, 25));
+														}
+														let stepsDeletionPromiseArray = [];
+														for (let i = 0; i < steps25Each.length; i++) {
+															stepsDeletionPromiseArray.push(new Promise((s_res, s_rej) => {
+																let batchDeleteParams = {
+																	RequestItems: {
+																		XcelAudit_Library_Steps: []
+																	}
+																};
+																for (let j = 0; j < steps25Each[i].length; j++) {
+																	let singleStep = steps25Each[i][j];
+																	let Item = {
+																		step_id: singleStep.step_id,
+																		sub_stage_id: singleStep.sub_stage_id,
+																	};
+																	batchDeleteParams.RequestItems.XcelAudit_Library_Steps.push({
+																		DeleteRequest: {
+																			Key: Item
+																		}
+																	});
+																}
+																batchDynamoOperation(batchDeleteParams, callback, function(data) {
+																	s_res(data);
+																});
+															}));
+														}
+														Promise.all(stepsDeletionPromiseArray).then((data) => {
+															let getAllFieldsParams = {
+																TableName: 'XcelAudit_Steps_FormFields',
+																KeyConditionExpression: '#audit_library_id = :audit_library_id',
+																ExpressionAttributeNames: { '#audit_library_id': 'audit_library_id' },
+																ExpressionAttributeValues: { ':audit_library_id': project.Items[0].selected_template_id },
+															};
+															queryAllDynamo(getAllFieldsParams, callback, function(fields) {
+																if (fields.Count > 0) {
+																	let fields25Each = [];
+																	while (fields.Items.length) {
+																		fields25Each.push(fields.Items.splice(0, 25));
+																	}
+																	let fieldsDeletionPromiseArray = [];
+																	for (let i = 0; i < fields25Each.length; i++) {
+																		fieldsDeletionPromiseArray.push(new Promise((f_res, f_rej) => {
+																			let batchDeleteParams = {
+																				RequestItems: {
+																					XcelAudit_Steps_FormFields: []
+																				}
+																			};
+																			for (let j = 0; j < fields25Each[i].length; j++) {
+																				let singleField = fields25Each[i][j];
+																				let Item = {
+																					audit_library_id: singleField.audit_library_id,
+																					step_id__field_id: singleField.step_id__field_id,
+																				};
+																				batchDeleteParams.RequestItems.XcelAudit_Steps_FormFields.push({
+																					DeleteRequest: {
+																						Key: Item
+																					}
+																				});
+																			}
+																			batchDynamoOperation(batchDeleteParams, callback, function(data) {
+																				f_res(data);
+																			});
+																		}));
+																	}
+																	Promise.all(fieldsDeletionPromiseArray).then((data) => {
+																		let deleteProjectParams = {
+																			TableName: "XcelAudit_Projects",
+																			Key: {
+																				project_id: client.Items[0].projects[i]
+																			}
+																		}
+																		deleteFromDynamo(deleteProjectParams, callback, function(data) {
+																			let deleteLibraryParams = {
+																				TableName: "XcelAudit_AuditLibraries",
+																				Key: {
+																					audit_library_id: project.Items[0].selected_template_id
+																				}
+																			};
+																			deleteFromDynamo(deleteLibraryParams, callback, function(data) {
+																				let getAllExternalUsersParams = {
+																					TableName: 'XcelAudit_UserPortal_Users',
+																					IndexName: "client_id-index",
+																					KeyConditionExpression: '#client_id = :client_id',
+																					FilterExpression: "user_type = :user_type",
+																					ExpressionAttributeNames: { '#client_id': 'client_id' },
+																					ExpressionAttributeValues: { ':client_id': project.Items[0].client_id, ":user_type": "EXTERNAL" },
+																				};
+																				queryAllDynamo(getAllExternalUsersParams, callback, function(users) {
+																					if (users.Count > 0) {
+																						let users25Each = [];
+																						while (fields.Items.length) {
+																							users25Each.push(fields.Items.splice(0, 25));
+																						}
+																						let usersDeletionPromiseArray = [];
+																						for (let i = 0; i < users25Each.length; i++) {
+																							usersDeletionPromiseArray.push(new Promise((f_res, f_rej) => {
+																								let batchDeleteParams = {
+																									RequestItems: {
+																										XcelAudit_UserPortal_Users: []
+																									}
+																								};
+																								for (let j = 0; j < users25Each[i].length; j++) {
+																									let singleUser = users25Each[i][j];
+																									let Item = {
+																										user_id: singleUser.user_id
+																									};
+																									batchDeleteParams.RequestItems.XcelAudit_UserPortal_Users.push({
+																										DeleteRequest: {
+																											Key: Item
+																										}
+																									});
+																								}
+																								batchDynamoOperation(batchDeleteParams, callback, function(data) {
+																									f_res(data);
+																								});
+																							}));
+																						}
+																						Promise.all(usersDeletionPromiseArray).then((data) => {
+																							project_res("Not Found");
+																						});
+																					}
+																					else {
+																						project_res("Not Found");
+																					}
+																				});
+																			});
+																		});
+																	});
+																}
+																else {
+																	project_res("Not Found");
+																}
+															});
+															project_res("Not Found");
+														});
+													}
+													else {
+														project_res("Not Found");
+													}
+												});
+											});
+										}
+										else {
+											project_res("Not Found");
+										}
+									});
+								}
+								else {
+									project_res("Not Found");
+								}
+							});
+						}));
+					}
+					Promise.all(projects_promises).then((data) => {
+						let deleteProjectParams = {
+							TableName: "XcelAudit_Clients",
+							Key: {
+								client_id: client.Items[0].client_id
+							}
+						};
+						deleteFromDynamo(deleteProjectParams, callback, function(data) {
+							callback(null, { status: 'Success', Status_Message: 'Deleted client Successfully!!' });
+						});
+					}).catch((err) => {
+						console.log(err);
+						callback(new Error(err));
+					});
+				}
+				else {
+					let deleteProjectParams = {
+						TableName: "XcelAudit_Clients",
+						Key: {
+							client_id: client.Items[0].client_id
+						}
+					};
+					deleteFromDynamo(deleteProjectParams, callback, function(data) {
+						callback(null, { status: 'Success', Status_Message: 'Deleted client Successfully!!' });
+					});
+				}
+			}
+			else {
+				callback(new Error("Client with ID: " + event.client_id + " Not Found"));
+			}
+		});
+	}
+	else {
+		callback(new Error("Empty Fields Occurred Delete Client"));
+	}
+}
+
+exports.handler = (event, context, callback) => {
+	console.log(event);
+	switch (event.command) {
+		case 'createClient':
+			createClient(event, context, callback);
+			break;
+		case 'listClients':
+			listClients(event, context, callback);
+			break;
+		case 'updateClient':
+			updateClient(event, context, callback);
+			break;
+		case 'listPortalLogs':
+			listPortalLogs(event, context, callback);
+			break;
+		case 'getCurrentUserDetails':
+			getCurrentUserDetails(event, context, callback);
+			break;
+		case 'createRole':
+			createRole(event, context, callback);
+			break;
+		case 'listRoles':
+			listRoles(event, context, callback);
+			break;
+		case 'updateRole':
+			updateRole(event, context, callback);
+			break;
+		case 'createInternalUser':
+			createInternalUser(event, context, callback);
+			break;
+		case 'listInternalUsers':
+			listInternalUsers(event, context, callback);
+			break;
+		case 'updateInternalUser':
+			updateInternalUser(event, context, callback);
+			break;
+		case 'createExternalUser':
+			createExternalUser(event, context, callback);
+			break;
+		case 'listExternalUsers':
+			listExternalUsers(event, context, callback);
+			break;
+		case 'updateExternalUser':
+			updateExternalUser(event, context, callback);
+			break;
+		case 'forgotPassword':
+			forgotPassword(event, context, callback);
+			break;
+		case "deleteClient":
+			delete_client(event, context, callback);
+			break;
+		case "deleteInternalOrExternalUser":
+			delete_internal_or_external_user(event, context, callback);
+			break;
+		default:
+			callback(new Error('Command not found'));
+	}
+};
