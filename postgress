@@ -1,0 +1,52 @@
+-- FUNCTION: public.pd_get_users_by_location(character varying, character varying, character varying, integer)
+
+-- DROP FUNCTION IF EXISTS public.pd_get_users_by_location(character varying, character varying, character varying, integer);
+
+CREATE OR REPLACE FUNCTION public.pd_get_users_by_location(
+	pd_user_lat character varying,
+	pd_user_long character varying,
+	pd_user_status character varying,
+	pd_limit_count integer)
+    RETURNS TABLE(sl_no bigint, user_id character varying, user_lat character varying, user_long character varying, user_status character varying, distance numeric) 
+    LANGUAGE 'plpgsql'
+    COST 100
+    VOLATILE PARALLEL UNSAFE
+    ROWS 1000
+
+AS $BODY$
+/***************************************************************************************************************************
+--Author : Rajeev
+--Create date : 02-Nov-2021
+select * from pharmawrk_povs where organization_id = 'ccc98c15-9823-4547-8c90-8a7643d12fb2' AND pov_status = 'UNVERIFIED'
+select pov_name, pov_id from pharmawrk_povs where pov_name ilike '%dee%'
+select * from pharmawrk_povs where
+((matched_territories) && ('{"4c8adcf3-e09f-4241-8def-73d51ccd0df3", "e90810df-e324-4184-bbfd-3e4efac2f4bb"}') OR (pov_status = 'UNVERIFIED' AND organization_id = 'ccc98c15-9823-4547-8c90-8a7643d12fb2'))
+AND organization_id = 'ccc98c15-9823-4547-8c90-8a7643d12fb2'
+AND pov_status <> 'INACTIVE'
+AND pov_type in (select unnest ('{"DOCTOR", "PHARMACIST", "DISTRIBUTOR", "HOSPITAL"}' :: character varying[]))
+order by  ((ST_Distance(ST_SetSRID(ST_Point('77.62448069999999'::float,'12.9351929'::float),4326)::geography,ST_SetSRID(ST_Point(pov_lng::float,pov_lat::float),4326)::geography)) /1000)::NUMERIC
+limit 100;
+select * from pw_get_povs_by_users_territory_and_pov_type('{"4c8adcf3-e09f-4241-8def-73d51ccd0df3", "e90810df-e324-4184-bbfd-3e4efac2f4bb"}','12.9351929','77.62448069999999','{"DOCTOR", "PHARMACIST", "DISTRIBUTOR", "HOSPITAL"}','ccc98c15-9823-4547-8c90-8a7643d12fb2',250)
+select * from pd_get_users_by_location('33.54', '77.56', 'ACTIVE', 2)
+select * from price_drop_locations
+
+TRUNCATE TABLE  price_drop_locations;
+***************************************************************************************************************************/
+Declare
+
+BEGIN
+        return query
+        select
+		u.sl_no,
+        u.user_id,
+		u.user_lat,
+		u.user_long,
+		u.user_status,
+		 ((ST_Distance(ST_SetSRID(ST_Point(pd_user_long::float,pd_user_lat::float),4326)::geography,ST_SetSRID(ST_Point(u.user_long::float,u.user_lat::float),4326)::geography)) /1000)::NUMERIC
+		from price_drop_locations u
+		where u.user_status = pd_user_status
+		order by  ((ST_Distance(ST_SetSRID(ST_Point(pd_user_long::float,pd_user_lat::float),4326)::geography,ST_SetSRID(ST_Point(u.user_long::float,u.user_lat::float),4326)::geography)) /1000)::NUMERIC
+		limit pd_limit_count;
+-- 		offset offset_count;
+end;
+$BODY$;
